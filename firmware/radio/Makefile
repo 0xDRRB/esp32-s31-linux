@@ -6,9 +6,6 @@ RADIO_SRC := $(patsubst %/,%,$(dir $(RADIO_MAKEFILE)))
 PROJECT_DIR := $(abspath $(RADIO_SRC)/../..)
 include $(PROJECT_DIR)/configs/build-versions.mk
 
-ifneq ($(origin PROFILE),undefined)
-$(error PROFILE is removed; use the full board build)
-endif
 O ?= $(PROJECT_DIR)/out/radio
 RADIO_OUT := $(abspath $(O))
 GENERATED_DIR ?= $(abspath $(RADIO_OUT)/../generated)
@@ -37,9 +34,12 @@ IDF_PATH     ?= $(patsubst %/export.sh,%,$(IDF_EXPORT))
 # Match the compiler declared by the pinned IDF tools manifest.
 ESP_TOOLS ?= $(IDF_ROOT)/tools/riscv32-esp-elf/$(ESP_ELF_RELEASE)/riscv32-esp-elf
 
-# picolibc multilib matching the ilp32f radio world.
-PICOLIBC_LIB := $(ESP_TOOLS)/picolibc/riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei_zaamo_zalrsc/ilp32f
-PICOLIBC_GCC := $(firstword $(wildcard $(ESP_TOOLS)/picolibc/lib/gcc/riscv32-esp-elf/*/rv32imafc_zicsr_zifencei_zaamo_zalrsc/ilp32f))
+# Resolve the ILP32F multilib using the pinned compiler. GCC16 renamed its
+# ISA multilib directories; do not silently substitute a different ABI.
+RADIO_ISA := rv32imafc_zicsr_zifencei_zaamo_zalrsc
+PICOLIBC_MULTI := $(shell "$(ESP_TOOLS)/bin/riscv32-esp-elf-gcc" -march=$(RADIO_ISA) -mabi=ilp32f -print-multi-directory)
+PICOLIBC_LIB := $(ESP_TOOLS)/picolibc/riscv32-esp-elf/lib/$(PICOLIBC_MULTI)
+PICOLIBC_GCC := $(dir $(shell "$(ESP_TOOLS)/bin/riscv32-esp-elf-gcc" -march=$(RADIO_ISA) -mabi=ilp32f -print-libgcc-file-name))
 
 # The component closure is captured from IDF's generated build.  Its path
 # placeholders are resolved at build time, so the capture has no developer-
@@ -48,6 +48,7 @@ IDF_CAPTURED_INCLUDES := $(shell sed -e 's|@IDF_PATH@|$(IDF_PATH)|g' -e 's|@RADI
 IDF_BOOT_LINKPATH := $(shell sed -e 's|@IDF_PATH@|$(IDF_PATH)|g' -e 's|@RADIO_BUILD@|$(RADIO_BUILD_ABS)|g' $(RADIO_SRC)/boot_linkpath.txt)
 IDF_NET80211 := $(IDF_PATH)/components/esp_wifi/lib/esp32s31/libnet80211.a
 LINUX_NET80211 := libnet80211.s31-linux.a
+IDF_PP := $(IDF_PATH)/components/esp_wifi/lib/esp32s31/libpp.a
 # Resolve one ordered archive set for both the linker and dependency graph.
 # radio-idf-deps must finish before entering this component Makefile.
 RADIO_ARCHIVES := $(shell python3 $(PROJECT_DIR)/tools/build/radio_archives.py $(RADIO_SRC)/boot_link.txt "$(IDF_PATH)" "$(RADIO_BUILD_ABS)")
@@ -60,20 +61,22 @@ HEAP_WRAP_APIS := heap_caps_malloc heap_caps_free heap_caps_calloc \
 	heap_caps_get_largest_free_block heap_caps_add_region
 comma := ,
 HEAP_WRAP_FLAGS := $(addprefix -Wl$(comma)--wrap=,$(HEAP_WRAP_APIS))
-LINUX_WRAP_APIS := time esp_log_timestamp esp_timer_create esp_timer_delete \
+LINUX_WRAP_APIS := r_orca_lmp_tbl_register r_os_memblock_put r_os_memblock_put_from_cb time esp_log_timestamp esp_event_loop_create esp_timer_create esp_timer_delete \
 	esp_timer_start_once esp_timer_start_once_at esp_timer_start_periodic \
 	esp_timer_start_periodic_at esp_timer_stop esp_timer_restart \
+	ets_timer_done os_timer_done \
+	ets_timer_arm ets_timer_arm_us os_timer_arm os_timer_arm_us \
 	esp_timer_is_active esp_timer_get_time esp_intr_ptr_in_isr_region \
 	esp_intr_alloc esp_intr_enable esp_intr_disable esp_intr_free \
 	esp_ipc_call_blocking \
 	mpi_hal_write_to_mem_block mpi_hal_write_at_offset mpi_hal_write_rinv \
 	mpi_hal_read_result_hw_op \
-	ieee80211_set_tx_desc lmacTxFrame hal_crypto_set_key_entry \
-	lmacProcessTxError lmacTxDone esp_phy_enable esp_phy_disable \
+	   \
+	    \
 	coex_enable coex_disable \
-	coex_register_start_cb coex_register_ble_cb \
-	coex_schm_process_restart coex_schm_register_callback \
-	coex_hw_timer_set coex_hw_timer_enable coex_hw_timer_disable
+	coex_register_start_cb  \
+	  \
+
 LINUX_WRAP_FLAGS := $(addprefix -Wl$(comma)--wrap=,$(LINUX_WRAP_APIS))
 
 .PHONY: all clean idf-check linux-radio linux-kbuild
@@ -113,7 +116,7 @@ linux-radio-linked-imports.txt: $(LINUX_RADIO_LINKED_IMPORTS)
 $(LINUX_NET80211): $(IDF_NET80211)
 	cp $< $@
 
-linux_radio.raw.o: radio_stack.linux.o nofreertos_link.txt $(RADIO_SRC)/boot_flags.txt $(RADIO_SRC)/boot_linkpath.txt $(LINUX_NET80211) $(S31RTOS_LINUX_OBJS) $(RADIO_COEX_PRINTF_OBJ) $(RADIO_MAKEFILE) $(PROJECT_DIR)/tools/build/radio_tls.py $(RADIO_SRC)/prepare_xip_sections.py
+linux_radio.raw.o: radio_stack.linux.o s31_pp_submit.o s31_vhci.o s31_vhci_pool_wake.o nofreertos_link.txt $(RADIO_SRC)/boot_flags.txt $(RADIO_SRC)/boot_linkpath.txt $(LINUX_NET80211) $(S31RTOS_LINUX_OBJS) $(RADIO_COEX_PRINTF_OBJ) $(RADIO_MAKEFILE) $(PROJECT_DIR)/tools/build/radio_tls.py $(RADIO_SRC)/prepare_xip_sections.py
 	$(ESP_CC) -nostdlib -r -Wl,--gc-sections -Wl,--unique=.iram1* -Wl,--unique=.wifi*iram* $(HEAP_WRAP_FLAGS) $(LINUX_WRAP_FLAGS) \
 		-Wl,--undefined=s31_radio_stack_task \
 		-Wl,--undefined=s31_radio_wifi_control_task \
@@ -133,7 +136,7 @@ linux_radio.raw.o: radio_stack.linux.o nofreertos_link.txt $(RADIO_SRC)/boot_fla
 		-Wl,--undefined=s31_radio_fw_abi_version \
 		-Wl,--undefined=s31_rtos_init \
 		-Wl,--undefined=s31_rtos_tick \
-		-Wl,--undefined=s31_linux_timer_next_due_us \
+		-Wl,--undefined=s31_linux_timer_next_deadline_ns \
 		-Wl,--undefined=s31_rtos_hard_tick \
 		-Wl,--undefined=s31_rtos_free \
 		-Wl,--undefined=s31_rtos_task_release \
@@ -141,22 +144,20 @@ linux_radio.raw.o: radio_stack.linux.o nofreertos_link.txt $(RADIO_SRC)/boot_fla
 		-Wl,--undefined=xTaskCreatePinnedToCore \
 		$(shell cat $(RADIO_SRC)/boot_flags.txt) \
 		$(IDF_BOOT_LINKPATH) \
-		radio_stack.linux.o $(S31RTOS_LINUX_OBJS) $(RADIO_COEX_PRINTF_OBJ) \
+		radio_stack.linux.o s31_pp_submit.o s31_vhci.o s31_vhci_pool_wake.o $(S31RTOS_LINUX_OBJS) $(RADIO_COEX_PRINTF_OBJ) \
 		$(LINUX_NOFREERTOS_LINK) \
 		-L$(PICOLIBC_LIB) -L$(PICOLIBC_GCC) -lc -lm -lgcc -o $@
 	python3 $(PROJECT_DIR)/tools/build/radio_tls.py $@
 	python3 $(RADIO_SRC)/prepare_xip_sections.py $@
 
-linux_radio.exposed.o: linux_radio.raw.o
+linux_radio.exposed.o: linux_radio.raw.o $(RADIO_MAKEFILE)
 	$(ESP_TOOLS)/bin/riscv32-esp-elf-objcopy \
 		--globalize-symbol=wifi_on_coex_start_process \
 		--globalize-symbol=wifi_on_coex_schm_phase_process $< $@
 
-# IDF normally reaches the Wi-Fi workers through esp_wifi_ipc_internal().  S31
-# Linux serializes radio work on one worker, so expose those two execution-
-# context entry points.  The closed coexist scheme's existing esp_timer adapter
-# is dispatched by the compatibility timer bridge; it must not be advanced a
-# second time here.
+# Preserve the Wi-Fi owner's IPC endpoints. Native Linux owners remain
+# independently scheduled; this does not add a global execution gate.
+# SoftMAC publishes coexistence state through the existing scheduler APIs.
 linux_radio.resolved.o: linux_radio.exposed.o
 	$(ESP_TOOLS)/bin/riscv32-esp-elf-ld -r --no-relax $< -o $@
 
@@ -165,7 +166,7 @@ linux-radio-undefined.txt: linux_radio.resolved.o
 
 linux-radio-localize.txt: linux_radio.resolved.o $(RADIO_MAKEFILE)
 	$(ESP_TOOLS)/bin/riscv32-esp-elf-nm -g --defined-only $< | \
-		awk '{ n=$$NF; if (n !~ /^(s31_radio_fw_abi_version|s31_radio_(stack|shutdown|bt_(enable|disable)|wifi_(scan|connect|disconnect|control))_task|s31_radio_wifi_(read_mac|clock_enable|clock_disable)|s31_radio_(vhci|wifi)_try_send|s31_radio_wifi_try_send_interface|s31_radio_coex_status|s31_rtos_(init|tick|hard_tick|free|task_release|isr_depth)|s31_linux_timer_next_due_us|xTaskCreatePinnedToCore)$$/) print n; }' | \
+		awk '{ n=$$NF; if (n !~ /^(s31_radio_fw_abi_version|s31_radio_(stack|shutdown|bt_(enable|disable)|wifi_(scan|connect|disconnect|control))_task|s31_radio_wifi_(read_mac|clock_enable|clock_disable)|s31_radio_(vhci|wifi)_try_send|s31_radio_wifi_try_send_interface|s31_radio_coex_status|s31_rtos_(init|tick|hard_tick|free|task_release|isr_depth)|s31_linux_timer_next_deadline_ns|xTaskCreatePinnedToCore)$$/) print n; }' | \
 		sort -u > $@
 
 linux_radio.localized.o: linux_radio.resolved.o linux-radio-localize.txt
@@ -197,11 +198,16 @@ nofreertos_link.txt: $(RADIO_SRC)/boot_link.txt $(RADIO_BUILD_ABS)/build.ninja .
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 ESP_CC      := $(ESP_TOOLS)/bin/riscv32-esp-elf-gcc
+s31_pp_submit.S: $(IDF_PP) $(PROJECT_DIR)/tools/build/radio_pp_submit.py
+	python3 $(PROJECT_DIR)/tools/build/radio_pp_submit.py \
+		--ar $(ESP_TOOLS)/bin/riscv32-esp-elf-ar --archive $(IDF_PP) --output $@
+s31_pp_submit.o: s31_pp_submit.S $(RADIO_MAKEFILE)
+	$(ESP_CC) $(ESP_CFLAGS) -c $< -o $@
 ifneq ($(origin S31_WIFI_ONLY),undefined)
 $(error S31_WIFI_ONLY is removed; every build includes Wi-Fi and Bluetooth)
 endif
 RADIO_STACK_DEFS := -DS31_LINUX_SMODE
-ESP_CFLAGS  := -Os -mabi=ilp32f -march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_xesploop_xespv2p2 \
+ESP_CFLAGS  := -Os -mabi=ilp32f -march=$(RADIO_ISA) \
 		-mtune=esp-base -ffunction-sections -fdata-sections \
 		-fno-stack-protector -fno-builtin -ffreestanding -std=gnu11 -Wall \
 	-specs=picolibc.specs \
@@ -217,9 +223,16 @@ ESP_CFLAGS  := -Os -mabi=ilp32f -march=rv32imafc_zicsr_zifencei_zaamo_zalrsc_xes
 # be rebuilt whenever the IDF configuration changes.  Without this dependency,
 # btdm_lp.c could be rebuilt with controller sleep enabled while this object
 # retained sleep_en=0, leaving the closed controller's sleep environment NULL.
-radio_stack.linux.o: $(addprefix $(RADIO_SRC)/,radio_stack.c s31_softmac.inc s31_softmac_tx_agg.inc s31_softmac_tx_reports.inc s31_rtos/s31_rtos.h) $(PROJECT_DIR)/linux-esp32-s31/include/linux/esp32s31-radio-control.h $(RADIO_MAKEFILE) $(RADIO_SDKCONFIG)
+radio_stack.linux.o: $(addprefix $(RADIO_SRC)/,radio_stack.c s31_wifi_rom_runtime.inc s31_softmac.inc s31_softmac_coex_pm.inc s31_softmac_tx_agg.inc s31_softmac_tx_reports.inc s31_rtos/s31_rtos.h) $(PROJECT_DIR)/linux-esp32-s31/include/linux/esp32s31-radio-control.h $(RADIO_MAKEFILE) $(RADIO_SDKCONFIG)
 	$(ESP_CC) $(ESP_CFLAGS) -MMD -MP $(RADIO_STACK_DEFS) \
 		-I $(RADIO_SRC)/s31_rtos -c $< -o $@
+
+s31_vhci.o: $(RADIO_SRC)/s31_vhci.c $(RADIO_SRC)/s31_vhci_command.inc $(RADIO_SRC)/s31_vhci_acl.inc $(RADIO_SRC)/s31_vhci_bredr.inc $(IDF_PATH)/components/bt/porting_btdm/transport/driver/vhci/hci_driver_standard.c $(RADIO_SDKCONFIG)
+	$(ESP_CC) $(ESP_CFLAGS) -MMD -MP \
+		-I$(IDF_PATH)/components/bt/porting_btdm/transport/driver/vhci -c $< -o $@
+
+s31_vhci_pool_wake.o: $(RADIO_SRC)/s31_vhci_pool_wake.c $(RADIO_SRC)/s31_vhci_pool_wake.inc
+	$(ESP_CC) $(ESP_CFLAGS) -MMD -MP -c $< -o $@
 
 s31_linux_locks.o: $(RADIO_SRC)/s31_linux_locks.c $(RADIO_SRC)/s31_rtos/s31_rtos.h
 	$(ESP_CC) $(ESP_CFLAGS) -MMD -MP -DS31_LINUX_SMODE -I $(RADIO_SRC)/s31_rtos -c $< -o $@
@@ -244,7 +257,7 @@ FORCE:
 		--value="$(HEAP_WRAP_FLAGS) $(LINUX_WRAP_FLAGS)" \
 		--value="$(LINUX_NOFREERTOS_LINK) $(PICOLIBC_LIB) $(PICOLIBC_GCC)"
 
-RADIO_LOCAL_OBJS := radio_stack.linux.o $(S31RTOS_LINUX_OBJS) $(RADIO_COEX_PRINTF_OBJ)
+RADIO_LOCAL_OBJS := radio_stack.linux.o s31_vhci.o s31_vhci_pool_wake.o $(S31RTOS_LINUX_OBJS) $(RADIO_COEX_PRINTF_OBJ)
 $(RADIO_LOCAL_OBJS): .s31-build-config $(RADIO_MAKEFILE)
 $(filter s31_rtos/%,$(RADIO_LOCAL_OBJS)): | s31_rtos
 s31_rtos:

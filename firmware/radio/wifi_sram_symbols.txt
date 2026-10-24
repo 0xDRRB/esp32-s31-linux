@@ -1,11 +1,20 @@
 # Fixed native Wi-Fi datapath and RTOS SRAM placement for the S31 XIP image.
+# Pinned BT controller .iram1 IRQ/status/clock entry paths. IDF's dual-mode
+# linker maps these sections to instruction SRAM when flash-only mode is off.
+# Whole input sections are selected and every missing symbol fails the build.
+r_sym_bt_R9GZfnUbtn7k6mHtoZbv
+r_sym_bt_MDZbajeLxsB0cvuBOREd
+r_sym_bt_2VbAPsx8lRNZdbVZTEOe
+r_sym_bt_hkluARKZBNTcJqMeSNys
+r_sym_bt_3DcjgYC1ikQrP7jNyXGR
+r_sym_bt_iEsFo1nbR5S71P2lMKhY
+r_sym_bt_FYr6kIOvDbNGoOHfaRvK
+r_sym_bt_KrvfcwDw4eZoaTPVdFj5
+r_sym_bt_iN19Gr6IJgNcYWxdGwlS
+r_obd_capture_btlc_timer
 MODEM_CLOCK_instance
 PMU_instance
 __wrap_esp_timer_get_time
-__wrap_ieee80211_set_tx_desc
-__wrap_lmacProcessTxError
-__wrap_lmacTxDone
-__wrap_lmacTxFrame
 calc_checksum
 calloc_internal_wrapper
 cnx_node_is_existing
@@ -40,8 +49,8 @@ esp_reset_rpa_moudle
 esp_system_get_time
 esp_wifi_bt_power_domain_on
 esp_wifi_internal_on_coex_preemption_end
-ets_timer_arm
-ets_timer_arm_us
+__wrap_ets_timer_arm
+__wrap_ets_timer_arm_us
 ets_timer_disarm
 hal_clear_rx_beacon_pti
 hal_get_time_to_sta_next_tbtt
@@ -264,42 +273,30 @@ rc_get_sta_trc
 rc_set_per_conn_fix_rate
 realloc_internal_wrapper
 rtc_clk_xtal_freq_get
-s31_event_task_name
-s31_linux_timer_next_due_us
-s31_linux_timer_report
+s31_event_get
+s31_event_put
+s31_event_waiter_release
+s31_rtos_cleanup_drain
+s31_rtos_cleanup_pop
+s31_rtos_cleanup_push
+s31_rtos_event_runtime_reset
+s31_rtos_queue_runtime_reset
+s31_linux_timer_next_deadline_ns
 s31_linux_timers_tick
 s31_lock_get
 s31_lock_give
 s31_lock_take
-s31_queue_event_id
-s31_queue_is_wifi_main
 s31_queue_send_locked
 s31_queue_take_locked
-s31_queue_trace_receive
-s31_queue_trace_send
-s31_queue_valid
-s31_radio_bt_disable_task
-s31_radio_bt_enable_task
-s31_radio_coex_ble_disable_trace
-s31_radio_coex_ble_enable_trace
-s31_radio_coex_bt_phase_trace
-s31_radio_coex_hw_snapshot
-s31_radio_coex_start_trace
 s31_radio_coex_status
-s31_radio_coex_wifi_phase_direct
-s31_radio_coex_worker_tick
 s31_radio_log_vprintf
-s31_radio_ptr_is_hpsram
-s31_radio_shutdown_task
-s31_radio_stack_task
 s31_radio_vhci_try_send
 s31_radio_wifi_clock_disable
 s31_radio_wifi_clock_enable
-s31_radio_wifi_connect_task
-s31_radio_wifi_control_task
-s31_radio_wifi_disconnect_task
+# Initialization, enable/disable, shutdown, scan and connect/disconnect task
+# wrappers execute with caches available. Keep them (and the persistent Wi-Fi
+# control owner) in XIP; IRQ/critical callees retain their own SRAM placement.
 s31_radio_wifi_read_mac
-s31_radio_wifi_scan_task
 s31_radio_wifi_try_send
 s31_radio_wifi_try_send_interface
 s31_rtos_can_yield
@@ -308,9 +305,10 @@ s31_rtos_free
 s31_rtos_get_tick
 s31_rtos_hard_tick
 s31_rtos_in_isr
-s31_rtos_init
+# Bootstrap is cache-on on the Linux control stack; no IRAM residency needed.
 s31_rtos_malloc
 s31_rtos_task_entry
+s31_rtos_task_finalize
 s31_rtos_task_release
 s31_rtos_tick
 s31_rtos_use_internal_stacks
@@ -318,6 +316,9 @@ s31_sm_data_direct
 s31_sm_he_restore
 s31_sm_key_remove
 s31_sm_report
+# The private pinned TX submission copy is a per-frame hot path. It fits in
+# the existing instruction-SRAM reservation; no heap/reservation is enlarged.
+s31_sm_pp_submit
 s31_sm_rx
 s31_sm_rx_direct
 s31_sm_rx_frame
@@ -437,3 +438,126 @@ xTaskGetCurrentTaskHandle
 xTaskGetSchedulerState
 xTaskGetTickCount
 zalloc_internal_wrapper
+s31_timer_update_begin
+s31_timer_snapshot_publish
+s31_queue_call_finish
+s31_queue_call_release
+s31_queue_call_wait
+s31_queue_get
+s31_queue_init
+s31_queue_put
+
+# Timer exclusion/dispatch may be reached from a cache-sensitive callback.
+s31_timer_lock
+s31_timer_unlock
+s31_timer_dispatch_release
+xPortEnterCriticalTimeout
+
+# Fixed-va_list logging wrapper remains callable from SRAM continuations.
+s31_linux_printf
+
+# Completion credit publication follows the SRAM callback.
+s31_rtos_tx_flight_return
+
+# SDK SRAM scheduler insertion/retry path, including lead and reservation reads.
+# Do not change closed-controller retry budgets or timing guards.
+r_olc_sched_insert
+r_olc_sched_get_lead_ticks
+r_olc_sched_get_reserved_ticks
+r_btdm_common_sched_check_overlap
+r_btdm_common_sched_insert_forcibly
+# Complete the insert routine's ordinary setup/retry helpers and the actual
+# overlap guard body (the SDK public overlap entry is only a small wrapper).
+r_olc_sched_calc_first_allowed_tick
+r_olc_sched_check_asap_limit_reached
+r_olc_sched_conflict_handler
+r_olc_sched_get_rx_ww_offset
+r_olc_sched_sw_delay_on_expire
+r_olc_sched_get_mac_lead_ticks
+r_sym_bt_FovcDCPDYkKMaCv7y4Wb
+# Scheduler clock/offset arithmetic and the immediate common-list adapters.
+r_btdm_common_sched_entry_idx_to_list
+r_btdm_common_sched_get_sw_head
+r_bt_clk_add2
+r_bt_clk_add3
+r_bt_clk_diff
+r_bt_clk_sub
+r_bt_time_add
+r_bt_time_add_hus
+r_bt_time_sub
+r_bt_time_sub_hus
+r_bt_time_inc
+r_bt_time_dec
+r_olc_slot_phase_align_hi
+r_olc_util_get_mapping_olc_time
+r_olc_hal_get_local_coarse_drift
+r_olc_hal_get_local_coarse_jitter
+r_olc_hal_timeline_get_offset_sel
+r_obh_device_get_signed_offset_last_rxed
+r_olc_no_rx_thresh_get
+r_olc_util_get_ac_start_time
+r_sym_bt_0erovZ3h6jKPBvV00tVC
+r_sym_bt_vlE2mL5FNjejBKjkw4Lw
+r_sym_bt_vRZWg0Pde6qjNqrmQ0Ai
+r_sym_bt_syg8KrXLvNWRwTTTNS32
+# The exact page-scan retry loop and its direct preparation/clock helpers.
+r_olc_pscan_sched
+r_olc_pscan_total_win_time
+r_olc_sched_attr_get_asap_limit
+r_olc_sched_attr_set
+r_olc_sched_pti_dft_get
+r_olc_sched_pti_inc_get
+r_olc_util_slot_to_ticks
+olc_if_slot_to_ticks
+r_obh_mac_pscan_rxwin_set
+r_orca_log_get_level
+r_orca_log_get_printf
+r_orca_log_get_tag
+r_orca_trace_get_level
+wr_btdm_log_internal_x0
+wr_btdm_log_internal_x1
+wr_btdm_log_internal_x2
+wr_btdm_log_internal_x3
+wr_btdm_osal_rand
+wr_btdm_osal_hw_enter_critical
+wr_btdm_osal_hw_exit_critical
+xPortInIsrContext
+r_sym_bt_GpVIG3utkSeNoV7jMMLs
+r_sym_bt_tEePDasGxyVSjw9zYSCQ
+r_sym_bt_xPWv1Z87N9d40AR9yCcT
+r_sym_bt_f9lnjpPZUrZWyo34Wx2H
+r_sym_bt_jzw6WTDKUlY3F90cFtr2
+r_sym_bt_DAW3kYH6FVpSIwzdSgum
+r_sym_bt_yUD6rZb0YEF3mD3EaDar
+# Live IRQ source133 entry and its direct log-flag leaves. Registration identity
+# is captured by irq_hardware_stats; this is instruction placement, not proof
+# of the dispatcher's indirect callbacks or writable-data cache-off closure.
+r_sym_ble_ywjh0f9yjTBeI7XgS5da
+r_ble_log_set_buf_index_flag
+r_ble_log_reset_buf_index_flag
+
+# Per-packet queue/mutex admission and ownership helpers. Public API residency
+# alone leaves these out-of-line bodies in flash. Include both success and
+# unwind callbacks without changing their lifetime/PI semantics. Compiler clone
+# names are pinned deliberately: a changed payload must fail, never fall back.
+s31_admitted_xQueueGenericSend.constprop.0
+s31_admitted_xQueueSemaphoreTake.constprop.0
+s31_native_mutex_give.constprop.0
+s31_native_call_prepare
+s31_native_call_drop
+s31_native_call_release
+s31_native_attempt_release
+s31_native_attempt_settled
+s31_directory_lock
+s31_directory_unlock
+s31_queue_ref
+s31_lock_require
+s31_sm_pp_enqueue
+s31_sm_pp_post_result
+s31_sm_pp_recover
+s31_rtos_pp_notify_send
+s31_rtos_pp_notify_capable
+s31_rtos_softmac_tx_copy
+# Complete the bounded TX scope alongside its already-resident send path.
+
+s31_radio_coex_start

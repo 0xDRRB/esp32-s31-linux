@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /* Pinned S31 IDF a602e67b private TRC/PP ABI. TID0 only, STA peer index0,
- * HT20 long GI or negotiated HE-SU20/GI1.6. Caller executes under the existing radio owner/blob gate.
+ * HT20 long GI or negotiated HE-SU20/GI1.6. Caller is a persistent native radio owner.
  * No worker, packet cache, deliberate aggregation delay or native key/PN.
  */
 extern void ic_set_trc(const void *);
@@ -10,15 +10,12 @@ extern void hal_he_set_packet_padding_us(unsigned);
 extern uint8_t *rc_get_sta_trc(unsigned);
 extern void ic_ampdu_op(unsigned, unsigned, unsigned, unsigned);
 extern unsigned ppSearchTxQueue(unsigned, unsigned, unsigned, unsigned);
-extern void ppClearTxq(unsigned);
-extern void lmacStopTransmit(unsigned);
 
 static uint8_t *s31_sm_tx_peer;
-static uint8_t s31_sm_tx_ap[6], s31_sm_tx_mcs, s31_sm_tx_limit, s31_sm_tx_qid;
+static uint8_t s31_sm_tx_ap[6], s31_sm_tx_mcs, s31_sm_tx_limit;
 static bool s31_sm_tx_ba, s31_sm_tx_he;
 /* A bitmap avoids padding another byte into every eight-byte flight slot. */
 static uint64_t s31_sm_tx_agg_flights;
-
 
 static bool s31_sm_tx_agg_inflight(void)
 {
@@ -105,7 +102,6 @@ static int s31_sm_tx_peer_add(const struct s31_wifi_control *r)
 	s31_sm_tx_peer = peer;
 	s31_sm_tx_mcs = r->field;
 	s31_sm_tx_limit = r->dtim_period;
-	s31_sm_tx_qid = qid;
 	memcpy(s31_sm_tx_ap, r->mac, 6);
 	s31_sm_tx_ba = false;
 out:
@@ -116,13 +112,20 @@ out:
 static int s31_sm_tx_ba_control(const struct s31_wifi_control *r)
 {
 	uint8_t args[36] = {0};
-	unsigned i;
-	uint32_t cancelled[S31_SOFTMAC_PENDING];
-	unsigned n = 0;
-	if (!s31_sm_active || !s31_sm_tx_peer) return ESP_ERR_INVALID_STATE;
-	if (r->total || memcmp(r->mac, s31_sm_tx_ap, 6)) return ESP_ERR_INVALID_ARG;
+	if (!s31_sm_active) return ESP_ERR_INVALID_STATE;
+	if (r->total || (s31_sm_tx_peer && memcmp(r->mac, s31_sm_tx_ap, 6)))
+		return ESP_ERR_INVALID_ARG;
+	/* Unaggregated EBs own descriptors/key pins too. A missing BA peer is
+	 * not evidence that the PP/hardware queues are empty. */
+	if (r->operation == S31_WIFI_SOFTMAC_TX_BA_FLUSH)
+		return s31_sm_tx_drain();
+	if (!s31_sm_tx_peer) return ESP_ERR_INVALID_STATE;
 	if (r->operation == S31_WIFI_SOFTMAC_TX_BA_ON &&
 	    (!r->length || r->length < s31_sm_tx_limit)) return ESP_ERR_INVALID_ARG;
+	/* The frontend closes submissions and flushes all pending cookies, not
+	 * only aggregated ones. Drain all matching PP ownership on PP itself,
+	 * including interface waiting and TX-done lists, before releasing pins.
+	 * Waiting for this ioctl must not hold the Wi-Fi resource mutex. */
 	g_osi_funcs_p->_mutex_lock(g_wifi_global_lock);
 	if (r->operation == S31_WIFI_SOFTMAC_TX_BA_ON) {
 		ic_ampdu_op(0, 0, 0, 1);
@@ -139,30 +142,6 @@ static int s31_sm_tx_ba_control(const struct s31_wifi_control *r)
 		ic_set_trc(args);
 		s31_sm_tx_peer = NULL; s31_sm_tx_ba = false; s31_sm_tx_he = false;
 		memset(s31_sm_tx_ap, 0, sizeof(s31_sm_tx_ap));
-	} else if (r->operation == S31_WIFI_SOFTMAC_TX_BA_FLUSH) {
-		/* Only the TID0 prototype attaches EBs to AC2. The other raw
-		 * traffic keeps its null-peer AC0. Invalidate hardware first,
-		 * then clear this private queue. Direct recycling has no callback:
-		 * unpublish each flight before native reclamation and fail once. */
-		s31_sm_tx_ba = false;
-		ic_ampdu_op(0, 0, 0, 0);
-		for (i = 0; i < S31_SOFTMAC_PENDING; i++)
-			if (s31_sm_flights[i].eb && (s31_sm_tx_agg_flights & (UINT64_C(1) << i))) {
-				cancelled[n++] = s31_sm_flights[i].cookie;
-				s31_sm_flights[i].eb = NULL;
-				s31_sm_tx_agg_flights &= ~(UINT64_C(1) << i);
-				s31_sm_mac_ccmp_flights &= ~(UINT64_C(1) << i);
-			}
-		/* A drained queue can retain a recycled last-EB pointer in LMAC.
-		 * Its stop helper dereferences EB metadata even when HW is invalid.
-		 * With no native flights there is nothing to abort or recycle. */
-		if (n) {
-			lmacStopTransmit(2);
-			ppClearTxq(s31_sm_tx_qid);
-		}
-		for (i = 0; i < n; i++)
-			s31_sm_report(cancelled[i], false, (s31_sm_tx_he ? S31_SOFTMAC_TX_HE_RATE :
-				S31_SOFTMAC_TX_HT_RATE) | s31_sm_tx_mcs, 1);
 	} else if (r->operation == S31_WIFI_SOFTMAC_TX_BA_OFF) {
 		/* Linux may already have expired a cookie, so it must also check
 		 * native ownership before signalling STOP_CONT to mac80211. */

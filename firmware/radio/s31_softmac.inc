@@ -1,13 +1,20 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /* Private ABI recovered from IDF a602e67b, ESP32-S31 only. Included by radio_stack.c.
- * PP stage-0 callbacks and submissions run under the Linux blob gate. Never
+ * PP callbacks/submission use persistent CPU0 native radio owners. Never
  * retain eb after the callback; PP owns allocation after ppTxPkt on ALL returns.
  */
 _Static_assert(sizeof(struct s31_softmac_tx_header) == 12, "raw TX bridge ABI");
 _Static_assert(sizeof(struct s31_softmac_tx_status) == 8, "TX status bridge ABI");
 _Static_assert(sizeof(struct s31_softmac_rx_header) == 4, "raw RX bridge ABI");
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_timer.h"
+extern int s31_rtos_mutex_tx_credit_bind(void *handle);
+extern void s31_rtos_tx_flight_return(void);
+extern int s31_rtos_tx_pool_bind(void *counter);
+extern uint8_t *g_lmac_cnt_ptr;
+extern int s31_rtos_softmac_tx_copy(void *request);
+extern void ic_ebuf_recycle_tx(void *eb);
 _Static_assert(sizeof(void *) == 4, "PP descriptor ABI is RV32");
 _Static_assert(sizeof(struct s31_softmac_rx_view) == 8, "synchronous RX view ABI");
 _Static_assert(sizeof(((wifi_promiscuous_pkt_t *)0)->rx_ctrl) == 64,
@@ -18,11 +25,67 @@ extern void *ic_get_default_sched(void);
 extern uint8_t rc11NSchedTbl[14][12];
 extern uint8_t rc11AXSchedTbl[16][12];
 extern uint32_t hal_now(void);
-extern int ppTxPkt(void *eb, int post);
+extern int s31_sm_pp_submit(void *eb, int post);
+extern int pp_post(unsigned int signal, uint32_t parameter);
+extern void *xphyQueue;
+extern BaseType_t s31_rtos_pp_notify_send(void *queue, const void *item);
+extern int s31_rtos_pp_notify_capable(void);
+extern void *g_intr_lock_mux;
+extern uint8_t *pp_sig_cnt_ptr;
+extern uint8_t *g_pm_ptr;
+extern uint8_t *our_instances_ptr;
+
+/* The private pinned PP submission copy protects its two list appends and
+ * redirects its final pp_post tail call here. The SDK returns 1 both on recycle
+ * and on a lost notification after linking EB into PP's queue. Preserve the
+ * distinction without touching the SDK's other submission callers. */
+__attribute__((noinline)) int s31_sm_pp_post_result(unsigned int signal,
+                                                  uint32_t parameter)
+{
+	return pp_post(signal, parameter) ? 2 | (signal << 8) : 0;
+}
+static __attribute__((noinline)) void s31_sm_pp_recover(unsigned int result)
+{
+	/* pp_post already counted this event. Reposting through pp_post would
+	 * suppress it. Wait for actual capacity only after releasing the Wi-Fi
+	 * mutex; keep the descriptor/key flight pinned even if shutdown cancels
+	 * the native wait. Stop/flush then joins the actual PP/hardware owner. */
+	uint32_t event[2] = { result >> 8, 0 };
+	if (s31_rtos_pp_notify_send(xphyQueue, event) != pdTRUE) {
+		/* The failed raw send enqueued no event. pp_post's coalescing
+		 * admission remains counted, and pp_stop_sw_txq does not clear it.
+		 * Undo only this missing TX notification under pp_post's own IRQ
+		 * lock, or a BA-only drain could suppress all later notifications.
+		 * Signals0..4 coalesce at one (unlike counted signals6..8).
+		 * ROM pp_sig_cnt_ptr is initialized to the linked pp_sig_cnt by
+		 * pp_attach; use that binding rather than a relocated data address.
+		 * Descriptor/key ownership is unchanged until the real PP drain. */
+		if (event[0] <= 4) {
+			uint32_t irq = g_osi_funcs_p->_wifi_int_disable(g_intr_lock_mux);
+			if (pp_sig_cnt_ptr[event[0]] == 1)
+				pp_sig_cnt_ptr[event[0]] = 0;
+			g_osi_funcs_p->_wifi_int_restore(g_intr_lock_mux, irq);
+		}
+
+	}
+}
 extern int ppRegisterTxCallback(void (*cb)(void *), unsigned int index, unsigned int stage);
 extern int pp_unregister_tx_cb(unsigned int index);
 extern void ic_disable_crypto(unsigned int interface, unsigned int skip);
 extern void *g_wifi_global_lock;
+/* esp_wifi_driver.h's private wifi_ipc_config_t, RV32 ABI. Sync ioctls retain
+ * their config pointer. Keep our callback descriptors for the payload's whole
+ * lifetime so cancellation cannot expose a retired caller's stack to PP. */
+struct s31_sm_wifi_ipc_config {
+	int (*fn)(void *);
+	void *arg;
+	uint32_t arg_size;
+};
+_Static_assert(sizeof(struct s31_sm_wifi_ipc_config) == 12, "Wi-Fi IPC ABI");
+typedef struct s31_sm_wifi_ipc_config s31_sm_wifi_ipc_t;
+extern int esp_wifi_ipc_internal(struct s31_sm_wifi_ipc_config *, bool sync);
+extern void pp_stop_sw_txq(void);
+extern int lmac_stop_hw_txq(void);
 /* Pinned hal_ampdu.o RV32 ABI: hardware slot, interface, TA, TID, SSN, window.
  * Native ic_add_rx_ba swaps its first two arguments before this leaf helper. */
 extern void hal_agreement_add_rx_ba(unsigned, unsigned, const uint8_t *, unsigned, unsigned, unsigned);
@@ -34,8 +97,6 @@ extern void hal_crypto_enable(unsigned, unsigned, unsigned, unsigned);
 static uint32_t s31_sm_key_mask, s31_sm_key_hw_mask, s31_sm_tx_key_mask;
 static uint8_t s31_sm_tx_key_token;
 static uint8_t s31_sm_key_ta[5][6], s31_sm_key_id[5];
-static unsigned int s31_sm_key_error_trace;
-static unsigned int s31_sm_key_trace;
 static volatile uint32_t *s31_sm_key_valid(void)
 {
 	return (volatile uint32_t *)0x20104814U;
@@ -55,13 +116,87 @@ static void s31_sm_key_remove(unsigned int slot)
 	s31_sm_key_id[slot] = 0;
 }
 static bool s31_sm_active;
-static bool s31_sm_rx_view_enabled;
+/* mac80211 owns MLME. The SDK still needs its connected PM metadata and
+ * beacon timing to arbitrate RF ownership and signal the AP during BT slots.
+ * Scheduler bits alone leave its PM path disconnected and can starve RX. */
+static bool s31_sm_coex_saved;
+static uint32_t s31_sm_coex_old_interval, s31_sm_coex_old_status;
+static uint32_t s31_sm_coex_state, s31_sm_coex_period;
+static uint16_t s31_sm_coex_aid;
+static uint8_t s31_sm_coex_bssid[6];
+static void s31_sm_coex_pm_stop(void);
+
+static void s31_sm_coex_apply(unsigned int state, uint32_t period)
+{
+ unsigned int status = state == 2 ? 4 : state == 3 ? 2 : state;
+ if (state != 2) s31_sm_coex_pm_stop();
+ coex_schm_status_bit_clear(COEX_SCHM_ST_TYPE_WIFI, 0xffff);
+ coex_schm_status_bit_set(COEX_SCHM_ST_TYPE_WIFI, status);
+ coex_schm_interval_set(state == 2 ? period / 100 : state == 3 ? 240 : 100);
+}
+
+static void s31_sm_coex_restore(void)
+{
+ if (!s31_sm_coex_saved) return;
+ s31_sm_coex_pm_stop();
+ coex_schm_status_bit_clear(COEX_SCHM_ST_TYPE_WIFI, 0xffff);
+ coex_schm_status_bit_set(COEX_SCHM_ST_TYPE_WIFI, s31_sm_coex_old_status);
+ coex_schm_interval_set(s31_sm_coex_old_interval);
+ __atomic_store_n(&s31_sm_coex_saved, false, __ATOMIC_RELEASE);
+ s31_sm_coex_state = s31_sm_coex_period = 0;
+ s31_sm_coex_aid = 0;
+ memset(s31_sm_coex_bssid, 0, sizeof(s31_sm_coex_bssid));
+}
+
+static void s31_sm_coex_refresh(void)
+{
+ /* coex_core_enable releases its core lock before invoking the Wi-Fi start
+  * callback. Reuse the Wi-Fi resource mutex and recheck after taking it.
+  * This restores mac80211's scheduler truth after native disconnected-PM
+  * initialization, without a second coexistence restart or another worker. */
+ if (!__atomic_load_n(&s31_sm_coex_saved, __ATOMIC_ACQUIRE)) return;
+ g_osi_funcs_p->_mutex_lock(g_wifi_global_lock);
+ if (s31_sm_coex_saved)
+  s31_sm_coex_apply(s31_sm_coex_state, s31_sm_coex_period);
+ g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+}
+
+static int s31_sm_coex_bss(const struct s31_wifi_control *r)
+{
+ uint32_t period = (uint32_t)r->beacon_interval << 10;
+ if (!s31_sm_active) return ESP_ERR_INVALID_STATE;
+ if (r->field > 3 || (r->field == 2 &&
+     (!r->beacon_interval || !r->offset || r->offset > 2007 ||
+      (r->mac[0] & 1) || !memcmp(r->mac, "\0\0\0\0\0\0", 6))))
+  return ESP_ERR_INVALID_ARG;
+ g_osi_funcs_p->_mutex_lock(g_wifi_global_lock);
+ if (!r->field) {
+  s31_sm_coex_restore();
+ } else if (!s31_sm_coex_saved || r->field != s31_sm_coex_state ||
+            (r->field == 2 && (period != s31_sm_coex_period ||
+             r->offset != s31_sm_coex_aid || memcmp(r->mac, s31_sm_coex_bssid, 6)))) {
+  if (!s31_sm_coex_saved) {
+   s31_sm_coex_old_interval = coex_schm_interval_get();
+   s31_sm_coex_old_status = coex_schm_status_get(COEX_SCHM_ST_TYPE_WIFI);
+   __atomic_store_n(&s31_sm_coex_saved, true, __ATOMIC_RELEASE);
+  }
+  /* Retire the old AP's timers before publishing a replacement identity. */
+  s31_sm_coex_pm_stop();
+  s31_sm_coex_state = r->field;
+  s31_sm_coex_period = period;
+  s31_sm_coex_aid = r->field == 2 ? r->offset : 0;
+  memcpy(s31_sm_coex_bssid, r->mac, sizeof(s31_sm_coex_bssid));
+  s31_sm_coex_apply(r->field, period);
+ }
+ g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+ return 0;
+}
 static bool s31_sm_rx_ra_filter;
 static bool s31_sm_rx_error_filter;
 static bool s31_sm_rx_bssid_filter;
 static bool s31_sm_bssid_policy_active;
 static uint8_t s31_sm_bssid_policy_mac[6];
-static unsigned s31_sm_rx_bssid_filtered;
+#include "s31_softmac_coex_pm.inc"
 /* Apply only the existing associated STA policy. The control path disables
  * it synchronously for scans/OTHER_BSS/beacon-promiscuous/disassociation. */
 static bool s31_sm_bssid_should_drop(const uint8_t *frame,unsigned len,uint16_t fc)
@@ -72,14 +207,12 @@ static bool s31_sm_bssid_should_drop(const uint8_t *frame,unsigned len,uint16_t 
       memcmp(frame+16,s31_sm_bssid_policy_mac,6)) ||
      ((fc&12)==8 && (frame[4]&1) &&
       memcmp(frame+10,s31_sm_bssid_policy_mac,6))) {
-  s31_sm_rx_bssid_filtered++;
+
   return true;
  }
  return false;
 }
 
-static unsigned s31_sm_rx_errors_filtered;
-static unsigned s31_sm_rx_ra_filtered;
 /* Pinned hal_mac/he leaf ABI. Association setup only; Linux owns MLME. */
 extern void hal_mac_set_bssid(unsigned, const uint8_t *);
 extern void hal_he_bssid_init(unsigned);
@@ -120,8 +253,7 @@ static int s31_sm_he_bss(const struct s31_wifi_control *r)
   hal_he_set_mmss_and_aid(0, 0, r->field, 0);
  }
  g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
- s31_linux_printf("[S31-SM] HE BSS active=%u aid=%u color=%u enabled=%u\n",
-                  r->length, r->field, r->offset, r->total);
+
  return 0;
 }
 /* Pinned hal_rx_enable/disable_bssid_check: iface0 at 0x201040d8,
@@ -162,14 +294,39 @@ static int s31_sm_bssid_filter(const struct s31_wifi_control *r)
   memcpy(s31_sm_bssid_policy_mac,r->mac,6);
   __atomic_store_n(&s31_sm_bssid_policy_active,true,__ATOMIC_RELEASE);
  } else *s31_sm_bssid_filter_reg()&=~2U;
- s31_linux_printf("[S31-SM] BSSID filter enabled=%u reg=%08x\n",r->field,*s31_sm_bssid_filter_reg());
+
  g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
  return 0;
 }
 #define S31_SM_CB_INDEX 15U /* Inside the observed callback table, before +0x410. */
 struct s31_sm_flight { void *eb; uint32_t cookie; };
 static struct s31_sm_flight s31_sm_flights[S31_SOFTMAC_PENDING];
-static uint64_t s31_sm_mac_ccmp_flights;
+/* Native submission and PP completion can preempt one another on CPU0.
+ * RV32's ordinary uint64_t RMW can lose a different flight's update. Use
+ * one word AMO per changed slot rather than serializing vendor execution. */
+static uint32_t s31_sm_mac_ccmp_flights[2];
+static inline __attribute__((always_inline)) void s31_sm_key_pin_update(unsigned int slot,
+								    bool pin)
+{
+	uint32_t bit = 1U << (slot & 31);
+	uint32_t *word = &s31_sm_mac_ccmp_flights[slot >> 5];
+	if (pin) __atomic_fetch_or(word, bit, __ATOMIC_RELEASE);
+	else __atomic_fetch_and(word, ~bit, __ATOMIC_RELEASE);
+}
+static inline __attribute__((always_inline)) bool s31_sm_key_pins_any(void)
+{
+	/* Key mutation holds the Wi-Fi mutex, excluding new submissions. A
+	 * concurrent completion only clears bits, so two word loads suffice. */
+	return __atomic_load_n(&s31_sm_mac_ccmp_flights[0], __ATOMIC_ACQUIRE) ||
+	       __atomic_load_n(&s31_sm_mac_ccmp_flights[1], __ATOMIC_ACQUIRE);
+}
+
+static inline __attribute__((always_inline)) void s31_sm_key_pins_reset(void)
+{
+	/* Only after producer join and PP/hardware drain. */
+	__atomic_store_n(&s31_sm_mac_ccmp_flights[0], 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&s31_sm_mac_ccmp_flights[1], 0, __ATOMIC_RELEASE);
+}
 static bool s31_sm_cb_registered;
 static uint32_t s31_sm_epoch;
 static uint8_t s31_sm_mac[6];
@@ -179,10 +336,6 @@ static volatile uint32_t *s31_sm_rx_crypto_reg(void)
 	/* Pinned hal_crypto_init/enable/disable: STA crypto control. */
 	return (volatile uint32_t *)0x20104800U;
 }
-static unsigned int s31_sm_tx_trace, s31_sm_rx_trace, s31_sm_done_trace, s31_sm_protected_trace;
-static unsigned int s31_sm_ht_done_trace;
-static unsigned int s31_sm_phy_trace;
-static uint8_t s31_sm_rx_wire[sizeof(struct s31_softmac_rx_header) + S31_SOFTMAC_FRAME_MAX];
 /* Linux legacy rates: 1, 2, 5.5, 11, 6, 9, 12, 18, 24, 36, 48, 54 Mbps.
  * S31 PP/RX uses the native PHY rate encoding for legacy OFDM. */
 static const uint8_t s31_sm_phy_rates[] = { 0, 1, 2, 3, 11, 15, 10, 14, 9, 13, 8, 12 };
@@ -204,12 +357,41 @@ static void sm_put32(void *p, unsigned int offset, uint32_t value)
 {
 	memcpy((uint8_t *)p + offset, &value, sizeof(value));
 }
+
+/* The PP consumer can preempt our lower-priority CPU0 submitter. Its empty
+ * queue transition resets tail to &head, so publishing *tail and the new tail
+ * must be indivisible against that consumer and IRQ-side vendor access.
+ * Only the intrusive append is IRQ-fenced. Allocation, rate selection and the
+ * potentially blocking pp_post remain outside this local critical section. */
+void s31_sm_pp_enqueue(void *eb, unsigned int waiting)
+{
+	extern uint8_t *pTxRx;
+	uint32_t irq = g_osi_funcs_p->_wifi_int_disable(g_intr_lock_mux);
+	const void *meta = (const void *)(uintptr_t)sm_get32(eb, 52);
+	uint32_t control = sm_get32(meta, 16);
+	uint8_t *queue;
+	unsigned int tail;
+
+	if (waiting) {
+		queue = pTxRx + 8U * (110U + ((control >> 18) & 3U));
+		tail = 8;
+	} else {
+		queue = pTxRx + 52U * ((control >> 20) & 15U);
+		tail = 36;
+	}
+	sm_put32(eb, 48, 0);
+	sm_put32((void *)(uintptr_t)sm_get32(queue, tail), 0, (uintptr_t)eb);
+	sm_put32(queue, tail, (uintptr_t)eb + 48U);
+	g_osi_funcs_p->_wifi_int_restore(g_intr_lock_mux, irq);
+}
 static void sm_put16(void *p, unsigned int offset, uint16_t value)
 {
 	memcpy((uint8_t *)p + offset, &value, sizeof(value));
 }
 #include "s31_softmac_tx_reports.inc"
+static int s31_sm_tx_drain(void);
 #include "s31_softmac_tx_agg.inc"
+
 static void s31_sm_tx_done(void *eb)
 {
 	unsigned int i;
@@ -218,23 +400,21 @@ static void s31_sm_tx_done(void *eb)
 	for (i = 0; i < S31_SOFTMAC_PENDING; i++) {
 		if (s31_sm_flights[i].eb == eb) {
 			uint32_t cookie = s31_sm_flights[i].cookie;
-			s31_sm_flights[i].eb = NULL;
-			s31_sm_mac_ccmp_flights &= ~(UINT64_C(1) << i);
-			if (s31_sm_done_trace++ < 8)
-				s31_linux_printf("[S31-SM] TX done cookie=%u status=%u rate=%u retries=%u/%u\n",
-					cookie, meta[0x13], meta[0x0c], meta[6], meta[7]);
+			s31_sm_key_pin_update(i, false);
+
 			int rate = s31_sm_rate_index(meta[0x0c]);
 			if (meta[0x0c] >= 16 && meta[0x0c] <=
 			    ((sm_get32(meta, 0) & (1U << 31)) ? 25 : 23)) {
 				rate = ((sm_get32(meta, 0) & (1U << 31)) ?
 				S31_SOFTMAC_TX_HE_RATE : S31_SOFTMAC_TX_HT_RATE) | (meta[0x0c] - 16);
-				if (s31_sm_ht_done_trace++ < 4)
-					s31_linux_printf("[S31-SM] TX MCS done cookie=%u status=%u PHY=%u retries=%u/%u HE=%u fmt=%u gi=%u\n",
-						cookie, meta[0x13], meta[0x0c], meta[6], meta[7],
-						!!(sm_get32(meta, 0) & (1U << 31)), (meta[47] >> 3) & 15, meta[47] & 3);
+
 			}
 			s31_sm_report(cookie, meta[0x13] == 1, rate < 0 ? 0 : rate,
 				      1U + meta[6] + meta[7]);
+			/* Publish slot credit only after every old-slot access. This
+			 * stage-0 callback does not establish EB/buffer recycle. */
+			__atomic_store_n(&s31_sm_flights[i].eb, NULL, __ATOMIC_RELEASE);
+			s31_rtos_tx_flight_return();
 			break;
 		}
 	}
@@ -243,55 +423,27 @@ static void s31_sm_rx_frame(const wifi_promiscuous_pkt_t *packet,
                              const uint8_t *frame, wifi_promiscuous_pkt_type_t type)
 {
 	unsigned int sig_len = packet->rx_ctrl.sig_len;
- if (s31_sm_key_mask && packet->rx_ctrl.rx_state && s31_sm_key_error_trace++ < 32)
-  s31_linux_printf("[S31-SM] RX crypto error kind=%u state=%u end=%u fmt=%u sig=%u dump=%u match=%u/%u/%u/%u\n", type,
-   packet->rx_ctrl.rx_state, packet->rx_ctrl.rxend_state, packet->rx_ctrl.cur_bb_format,
-   sig_len, packet->rx_ctrl.dump_len, packet->rx_ctrl.rxmatch0, packet->rx_ctrl.rxmatch1,
-   packet->rx_ctrl.rxmatch2, packet->rx_ctrl.rxmatch3);
+
 	unsigned int len = sig_len >= 4 ? sig_len - 4 : 0;
 	unsigned int rate = packet->rx_ctrl.rate;
 	int rate_index = -1;
 	uint8_t encoding = 0, phy_flags = 0;
 	uint16_t fc = 0;
-	if (s31_sm_active && packet->rx_ctrl.cur_bb_format >= 2 && s31_sm_phy_trace++ < 24)
-		s31_linux_printf("[S31-SM] PHY type=%u fmt=%u state=%u sig=%u dump=%u rate=%u siga=%08x/%08x\n",
-			type, packet->rx_ctrl.cur_bb_format, packet->rx_ctrl.rx_state,
-			sig_len, packet->rx_ctrl.dump_len, rate,
-			packet->rx_ctrl.he_siga1, packet->rx_ctrl.he_siga2);
+
 	if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
 	/* Same STA unicast-RA rejection as the Linux frontend. Keep all groups,
 	 * beacons, and probe responses, including during a software scan. This
 	 * feature is negotiated only when Linux's RX filter is enabled. */
 	if (s31_sm_active && s31_sm_rx_ra_filter && len >= 24 &&
 	    !(frame[4] & 1) && memcmp(frame + 4, s31_sm_mac, 6)) {
-		s31_sm_rx_ra_filtered++;
+
 		return;
 	}
 	if (len >= 24) memcpy(&fc, frame, sizeof(fc));
  if (s31_sm_active && s31_sm_bssid_should_drop(frame,len,fc)) return;
 	if (type == WIFI_PKT_DATA && (fc & 12) != 8) return;
 	/* Probe only; do not mark plaintext/MIC validation from this trace. */
-	if (s31_sm_key_mask && len >= 40 && (fc & 0x4000) &&
-	    !memcmp(frame + 4, s31_sm_mac, 6) &&
-	    s31_sm_key_trace++ < 32) {
-		unsigned int hdr = 24 + ((fc & 0x0080) ? 2 : 0);
-		s31_linux_printf("[S31-SM] RX key probe fmt=%u state=%u end=%u sig=%u dump=%u match=%u/%u/%u/%u ccmp=%02x llc=%02x%02x\n",
-			packet->rx_ctrl.cur_bb_format, packet->rx_ctrl.rx_state,
-			packet->rx_ctrl.rxend_state, sig_len, packet->rx_ctrl.dump_len,
-			packet->rx_ctrl.rxmatch0, packet->rx_ctrl.rxmatch1,
-			packet->rx_ctrl.rxmatch2, packet->rx_ctrl.rxmatch3,
-			frame[hdr + 3], frame[hdr + 8], frame[hdr + 9]);
-	}
-	if (s31_sm_active && len >= 24 && (fc & 0x4000) &&
-	    !memcmp(frame + 4, s31_sm_mac, sizeof(s31_sm_mac)) &&
-	    s31_sm_protected_trace++ < 16)
-		s31_linux_printf("[S31-SM] RX protected own len=%u fc=%04x state=%u fmt=%u rate=%u\n",
-			len, fc, packet->rx_ctrl.rx_state, packet->rx_ctrl.cur_bb_format, rate);
 
-	if (s31_sm_active && s31_sm_rx_trace++ < 8)
-		s31_linux_printf("[S31-SM] RX type=%u sig=%u dump=%u fmt=%u rate=%u state=%u\n",
-			type, sig_len, packet->rx_ctrl.dump_len, packet->rx_ctrl.cur_bb_format,
-			rate, packet->rx_ctrl.rx_state);
 	/* The public callback payload contract uses sig_len, including FCS.
 	 * Pinned S31 hardware reports dump_len = sig_len + 4 despite the
 	 * dump_len header comment. Monitor captures show those extra bytes
@@ -341,23 +493,17 @@ static void s31_sm_rx_frame(const wifi_promiscuous_pkt_t *packet,
    phy_flags |= S31_SOFTMAC_RX_CCMP_VALID;
   }
  }
- if (s31_sm_rx_view_enabled) {
+ /* Valid management frames only; data packets do not enter the PM adapter. */
+ if ((fc & 0x00fc) == 0x0080 && len >= 36)
+  s31_sm_coex_beacon(frame);
+ {
   const struct s31_softmac_rx_view view = {
    .header = { .rate_index = rate_index, .encoding = encoding, .flags = phy_flags },
    .frame = frame,
   };
   s31_radio_wifi_receive_aux(S31_WIFI_IF_SOFTMAC_VIEW, (const void *)&view,
                             len, packet->rx_ctrl.channel, packet->rx_ctrl.rssi);
-  return;
  }
- memset(s31_sm_rx_wire, 0, sizeof(struct s31_softmac_rx_header));
-	s31_sm_rx_wire[0] = rate_index;
-	s31_sm_rx_wire[1] = encoding;
-	s31_sm_rx_wire[2] = phy_flags;
-	memcpy(s31_sm_rx_wire + sizeof(struct s31_softmac_rx_header), frame, len);
-	s31_radio_wifi_receive_aux(S31_WIFI_IF_SOFTMAC, s31_sm_rx_wire,
-				  len + sizeof(struct s31_softmac_rx_header),
-				  packet->rx_ctrl.channel, packet->rx_ctrl.rssi);
 }
 static void s31_sm_rx(void *buffer, wifi_promiscuous_pkt_type_t type)
 {
@@ -414,7 +560,6 @@ static void *s31_sm_rx_head(void)
 }
 _Static_assert(WIFI_PKT_MGMT == 0 && WIFI_PKT_CTRL == 1 &&
                WIFI_PKT_DATA == 2 && WIFI_PKT_MISC == 3, "pinned RX callback ABI");
-static unsigned s31_sm_direct_count[8];
 static void s31_sm_data_direct(void *last, unsigned count, unsigned state)
 {
  void *head = s31_sm_rx_head();
@@ -422,31 +567,31 @@ static void s31_sm_data_direct(void *last, unsigned count, unsigned state)
  unsigned bytes, off, need;
  uint16_t extra = 0, fc;
  typeof(((wifi_promiscuous_pkt_t *)0)->rx_ctrl) ctrl;
- if (!s31_sm_active) { s31_sm_direct_count[1]++; goto fallback; }
- if (count > 1 || head != last || !head) { s31_sm_direct_count[2]++; goto fallback; }
- if ((state & 0xf8) == 0x78) { s31_sm_direct_count[3]++; goto fallback; }
+ if (!s31_sm_active) { goto fallback; }
+ if (count > 1 || head != last || !head) { goto fallback; }
+ if ((state & 0xf8) == 0x78) { goto fallback; }
  buf = (void *)(uintptr_t)sm_get32(head, 4);
  bytes = (sm_get32(head, 0) >> 14) & 0x3fff;
- if (!buf || bytes < 64) { s31_sm_direct_count[4]++; goto fallback; }
+ if (!buf || bytes < 64) { goto fallback; }
  off = get_sublen_offset(buf, &extra) & 0xffff;
- if (off < 56 || off > bytes - 8 || bytes - off - 8 < 24) { s31_sm_direct_count[5]++; goto fallback; }
+ if (off < 56 || off > bytes - 8 || bytes - off - 8 < 24) { goto fallback; }
  memcpy(&ctrl, buf, 56);
  memcpy((uint8_t *)&ctrl + 56, buf + off, 8);
  /* The frontend rejects every nonzero rx_state already. Reject it before
   * the original sniffer allocates/queues a partial payload; the ROM caller
   * still owns descriptor recycling, exactly as on the valid direct path. */
  if (s31_sm_rx_error_filter && ctrl.rx_state) {
-  s31_sm_rx_errors_filtered++;
+
   return;
  }
  memcpy(&fc, buf + off + 8, sizeof(fc));
  if (((fc & 12) != 8 && (fc & 12) != 0) || ctrl.sig_len < 28 || ctrl.sig_len > S31_SOFTMAC_FRAME_MAX+4)
-  { s31_sm_direct_count[6]++; goto fallback; }
+  { goto fallback; }
  need = ctrl.sig_len - 4;
  if (s31_sm_key_hw_mask && !ctrl.rx_state && !ctrl.rxend_state &&
      ctrl.dump_len + 4U == ctrl.sig_len) need -= 8;
- if (need > bytes - off - 8) { s31_sm_direct_count[7]++; goto fallback; }
- s31_sm_direct_count[0]++;
+ if (need > bytes - off - 8) { goto fallback; }
+
  s31_sm_rx_frame((const void *)&ctrl, buf + off + 8, (fc & 12) ? WIFI_PKT_DATA : WIFI_PKT_MGMT);
  return;
 fallback:
@@ -457,7 +602,7 @@ static int s31_sm_sniffer_install(void)
  void (**slot)(void *) = s31_sm_sniffer_slot();
  if (*slot != wDev_SnifferRxAmpdu || *s31_sm_data_slot() != wDev_SnifferRxData)
   return ESP_ERR_INVALID_STATE;
- memset(s31_sm_direct_count, 0, sizeof(s31_sm_direct_count));
+
  s31_sm_data_saved = *s31_sm_data_slot();
  *s31_sm_data_slot() = s31_sm_data_direct;
  s31_sm_sniffer_saved = *slot;
@@ -466,15 +611,7 @@ static int s31_sm_sniffer_install(void)
 }
 static void s31_sm_sniffer_restore(void)
 {
- if (s31_sm_rx_bssid_filter) s31_linux_printf("[S31-SM] early BSSID filtered=%u\n",s31_sm_rx_bssid_filtered);
- if (s31_sm_rx_error_filter)
-  s31_linux_printf("[S31-SM] early RX errors filtered=%u\n",s31_sm_rx_errors_filtered);
- if (s31_sm_data_saved)
-  s31_linux_printf("[S31-SM] early RA filtered=%u\n", s31_sm_rx_ra_filtered);
- if (s31_sm_data_saved)
-  s31_linux_printf("[S31-SM] direct fast=%u inactive=%u scatter=%u state=%u short=%u offset=%u type=%u bounds=%u\n",
-   s31_sm_direct_count[0],s31_sm_direct_count[1],s31_sm_direct_count[2],s31_sm_direct_count[3],
-   s31_sm_direct_count[4],s31_sm_direct_count[5],s31_sm_direct_count[6],s31_sm_direct_count[7]);
+
  if (s31_sm_data_saved) {
   *s31_sm_data_slot() = s31_sm_data_saved;
   s31_sm_data_saved = NULL;
@@ -484,11 +621,29 @@ static void s31_sm_sniffer_restore(void)
   s31_sm_sniffer_saved = NULL;
  }
 }
-static int s31_sm_send(uint8_t *wire, uint16_t length)
+/* Only the persistent CPU0 submitter opens this bounded Wi-Fi resource
+ * scope. It is an ordinary recursive native mutex lease, never a vendor
+ * execution gate: radio IRQs and other tasks remain preemptible. */
+/* The single kernel submitter owns begin/end and its bounded pass budget.
+ * The native recursive mutex already owns task identity and validates unlock;
+ * duplicating its owner and budget here adds no lifetime protection. */
+static int s31_sm_tx_batch_begin(void)
+{
+    /* Never wait behind a control operation which itself is joining PP. */
+    return xSemaphoreTakeRecursive(g_wifi_global_lock, 0) ?
+        0 : S31_WIFI_TX_RETRY_LOCK;
+}
+static int s31_sm_tx_batch_end(void)
+{
+    g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+    return 0;
+}
+static int s31_sm_send(const struct s31_softmac_tx_view *view, uint16_t view_size)
 {
 	struct s31_softmac_tx_header header;
-	uint8_t *frame = wire + sizeof(header), *eb, *meta, *desc;
-	unsigned int i, len, hdrlen;
+	const uint8_t *frame = view->prefix;
+	uint8_t *eb, *meta, *desc;
+	unsigned int i, len, hdrlen, flight_limit;
 	uint16_t fc;
 	bool qos;
 	bool ht, he;
@@ -496,9 +651,10 @@ static int s31_sm_send(uint8_t *wire, uint16_t length)
 	bool mac_ccmp;
 	int rc;
 
-	if (length < sizeof(header) + 24 || length > sizeof(header) + S31_SOFTMAC_FRAME_MAX)
+	if (view_size != sizeof(*view) || view->length < 24 ||
+	    view->length > S31_SOFTMAC_FRAME_MAX || !view->token)
 		return ESP_ERR_INVALID_ARG;
-	memcpy(&header, wire, sizeof(header));
+	header = view->header;
 	ht = header.reserved[0] == 1 || header.reserved[0] == 2;
 	he = header.reserved[0] == 2;
 	ampdu = header.reserved[1] == 1;
@@ -511,7 +667,7 @@ static int s31_sm_send(uint8_t *wire, uint16_t length)
 		s31_sm_report(header.cookie, false, 0, 1);
 		return 0;
 	}
-	len = length - sizeof(header);
+	len = view->length;
 	memcpy(&fc, frame, sizeof(fc));
 	if (ht && ((fc & 0x000c) != 8 || (frame[4] & 1))) goto rejected;
 	qos = (fc & 0x000c) == 8 && (fc & 0x0080);
@@ -531,16 +687,11 @@ static int s31_sm_send(uint8_t *wire, uint16_t length)
 	    (frame[24] & 15) || !s31_sm_tx_peer || !s31_sm_tx_ba ||
 	    header.rate_index != s31_sm_tx_mcs ||
 	    memcmp(frame + 4, s31_sm_tx_ap, 6))) goto rejected;
-	/* We may run on PP itself. Never wait for a control task holding the
-	 * global lock while it waits for PP to consume its queued command.
-	 * No descriptor/status is consumed before this retryable failure. */
-	if (!xSemaphoreTakeRecursive(g_wifi_global_lock, 0))
-		return ESP_ERR_NO_MEM;
+	/* The bounded submit scope retains the Wi-Fi resource lock here. */
 	/* HE is limited to the negotiated native BA path. Retiring the BSS or
 	 * a different peer must never turn an already queued HT frame into HE. */
 	if ((ampdu && he != s31_sm_tx_he) ||
 	    (he && (!ampdu || !s31_sm_tx_he || !s31_sm_he_saved))) {
-		g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
 		goto rejected;
 	}
 	/* Key changes share this lock. Do not send plaintext after a removal,
@@ -550,24 +701,43 @@ static int s31_sm_send(uint8_t *wire, uint16_t length)
 	    !(*s31_sm_key_valid() & (1U << 4)) ||
 	    memcmp(frame + 4, s31_sm_key_ta[4], 6) ||
 	    (frame[hdrlen + 3] >> 6) != s31_sm_key_id[4])) {
-		g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
 		goto rejected;
 	}
-	for (i = 0; i < S31_SOFTMAC_PENDING; i++)
-		if (!s31_sm_flights[i].eb)
+	flight_limit = S31_SOFTMAC_PENDING;
+	for (i = 0; i < flight_limit; i++)
+		if (!__atomic_load_n(&s31_sm_flights[i].eb, __ATOMIC_ACQUIRE))
 			break;
-	if (i == S31_SOFTMAC_PENDING) {
-		g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
-		goto rejected;
+	if (i == flight_limit) {
+		/* No cookie/descriptor was submitted. Preserve the Linux staging
+		 * slot until an in-flight completion makes room. */
+		return S31_WIFI_TX_RETRY_FLIGHT;
 	}
 	/* Class 1 and metadata follow esp_wifi_80211_tx/output_raw_process. */
-	eb = ic_ebuf_alloc(frame, 1, len);
+	/* Live pp_wdev_funcs+392 resolves to ROM esf_buf_alloc. Both its
+	 * static path and dynamic delegate explicitly skip memcpy for NULL.
+	 * The returned descriptor is private until ppTxPkt below. */
+	eb = ic_ebuf_alloc(NULL, 1, len);
 	if (!eb) {
-		g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
-		goto rejected;
+		/* Internal DMA fragmentation/pressure is retryable. A terminal
+		 * status here falsely consumes a frame which never reached PP. */
+		return ESP_ERR_NO_MEM;
 	}
 	meta = (void *)(uintptr_t)sm_get32(eb, 0x34);
 	desc = (void *)(uintptr_t)sm_get32(eb, 4);
+	{
+		struct s31_softmac_tx_copy copy = {
+			.token = view->token,
+			.destination = sm_get32(desc, 4),
+			.length = len,
+		};
+		if (!s31_rtos_softmac_tx_copy(&copy)) {
+			/* PP has never seen this descriptor. Only this failure path
+			 * returns our private reservation through the real recycler. */
+			ic_ebuf_recycle_tx(eb);
+			goto rejected;
+		}
+		frame = (const void *)(uintptr_t)copy.destination;
+	}
 	sm_put16(eb, 0x14, hdrlen);
 	sm_put16(eb, 0x16, len - hdrlen);
 	sm_put32(desc, 0, (sm_get32(desc, 0) & ~0x2fffc000U) | 0xc0000000U |
@@ -610,63 +780,163 @@ static int s31_sm_send(uint8_t *wire, uint16_t length)
 		(ht ? rc11NSchedTbl[8 - header.rate_index] : ic_get_default_sched())));
 	if (ampdu) s31_sm_tx_agg_prepare(eb, len, hdrlen);
 	s31_sm_flights[i] = (struct s31_sm_flight) { .eb = eb, .cookie = header.cookie };
-	if (mac_ccmp) s31_sm_mac_ccmp_flights |= UINT64_C(1) << i;
-	else s31_sm_mac_ccmp_flights &= ~(UINT64_C(1) << i);
+	s31_sm_key_pin_update(i, mac_ccmp);
 	if (ampdu) s31_sm_tx_agg_flights |= UINT64_C(1) << i;
 	else s31_sm_tx_agg_flights &= ~(UINT64_C(1) << i);
-	if (s31_sm_tx_trace++ < 8)
-		s31_linux_printf("[S31-SM] TX submit cookie=%u len=%u fc=%04x\n", header.cookie, len, fc);
-	rc = ppTxPkt(eb, 1);
-	/* PP may recycle on rejection, or enqueue even when post fails. Never
-	 * free eb here, and never return a retryable code after this call. */
-	if (rc && s31_sm_flights[i].eb == eb) {
-		s31_sm_flights[i].eb = NULL;
-		s31_sm_mac_ccmp_flights &= ~(UINT64_C(1) << i);
+
+	rc = s31_sm_pp_submit(eb, 1);
+	/* Only 1 establishes rejection/recycle. A tagged notification failure
+	 * still belongs to PP, including its key pin and completion ownership. */
+	if (rc == 1 && s31_sm_flights[i].eb == eb) {
+		s31_sm_key_pin_update(i, false);
 		s31_sm_report(header.cookie, false, 0, 1);
+		__atomic_store_n(&s31_sm_flights[i].eb, NULL, __ATOMIC_RELEASE);
+		s31_rtos_tx_flight_return();
 	}
-	g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+	if (rc & 2) {
+		/* Recovery may sleep on PP queue capacity. Close the resource scope
+		 * first, retaining each descriptor/key flight and its source lease.
+		 * Tell Linux this accepted frame ended the current batch. */
+		if (s31_sm_tx_batch_end())
+			return ESP_ERR_INVALID_STATE;
+		s31_sm_pp_recover((unsigned int)rc);
+		return S31_WIFI_TX_BATCH_CLOSED;
+	}
 	return 0;
 rejected:
 	s31_sm_report(header.cookie, false, 0, 1);
 	return 0;
 }
+static __attribute__((noinline)) int s31_sm_tx_drain_in_pp(void *unused)
+{
+	uint32_t cancelled[S31_SOFTMAC_PENDING];
+	unsigned int i, n = 0;
+	(void)unused;
+	/* Linux closed and joined source submissions before this synchronous
+	 * PP ioctl. Running on PP itself excludes its queue consumer without a
+	 * global execution gate. Keep hardware key pins through actual recycle
+	 * and hardware stop, including the three interface waiting lists and
+	 * TX-done list which a single ppClearTxq(qid) does not drain. */
+	g_osi_funcs_p->_mutex_lock(g_wifi_global_lock);
+	for (i = 0; i < S31_SOFTMAC_PENDING; i++)
+		if (s31_sm_flights[i].eb) {
+			cancelled[n++] = s31_sm_flights[i].cookie;
+			/* Direct recycling does not promise our completion callback.
+			 * Prevent a late callback from reporting the same cookie twice;
+			 * the separate key bitmap stays pinned until both drains return. */
+			__atomic_store_n(&s31_sm_flights[i].eb, NULL, __ATOMIC_RELEASE);
+		}
+	ic_ampdu_op(0, 0, 0, 0);
+	s31_sm_tx_ba = false;
+	/* Match wifi_hw_stop's software-then-hardware order. The hardware helper
+	 * checks live LMAC instances, avoiding stale last-EB dereferences on an
+	 * idle queue. Both helpers are the actual linked SDK implementations. */
+	pp_stop_sw_txq();
+	lmac_stop_hw_txq();
+	s31_sm_key_pins_reset();
+	s31_sm_tx_agg_flights = 0;
+	for (i = 0; i < n; i++)
+		s31_sm_report(cancelled[i], false, 0, 1);
+	if (n) s31_rtos_tx_flight_return();
+	g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+
+	return 0;
+}
+static int s31_sm_tx_drain(void)
+{
+	static struct s31_sm_wifi_ipc_config drain = { .fn = s31_sm_tx_drain_in_pp };
+	return esp_wifi_ipc_internal(&drain, true);
+}
+static __attribute__((noinline)) int s31_sm_stopped_notifications_in_pp(void *unused)
+{
+	uint32_t irq;
+	unsigned int i, count;
+	(void)unused;
+	/* Only after STA_STOP: wifi_hw_stop disabled the chip and cleared its
+	 * interrupt handlers. This FIFO PP ioctl also joins previously queued
+	 * completion notifications. Never clear a coalescing count while a TX
+	 * producer or an older queued token could still consume that count. */
+	if (s31_sm_active || s31_wifi_start_requested || s31_sm_stop_pending ||
+	    s31_sm_key_pins_any() || s31_sm_tx_agg_flights)
+		return ESP_ERR_INVALID_STATE;
+	for (i = 0; i < S31_SOFTMAC_PENDING; i++)
+		if (s31_sm_flights[i].eb) return ESP_ERR_INVALID_STATE;
+	irq = g_osi_funcs_p->_wifi_int_disable(g_intr_lock_mux);
+	count = pp_sig_cnt_ptr[16];
+	/* Signal16 is coalesced, not a counted6..8 event. A missing queue send
+	 * leaves one behind even after real SW/HW retirement and esp_wifi_stop. */
+	if (count <= 1) pp_sig_cnt_ptr[16] = 0;
+	g_osi_funcs_p->_wifi_int_restore(g_intr_lock_mux, irq);
+	if (count > 1) return ESP_ERR_INVALID_STATE;
+
+	return 0;
+}
+static __attribute__((noinline)) int s31_sm_stop_in_pp(void *unused)
+{
+	unsigned int i;
+	int rc;
+	s31_sm_tx_drain_in_pp(unused);
+	g_osi_funcs_p->_mutex_lock(g_wifi_global_lock);
+	if (s31_sm_tx_peer) {
+		struct s31_wifi_control tx_stop = { .operation = S31_WIFI_SOFTMAC_TX_PEER_DEL };
+		memcpy(tx_stop.mac, s31_sm_tx_ap, 6);
+		rc = s31_sm_tx_ba_control(&tx_stop);
+		if (rc) {
+			g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+			return rc;
+		}
+	}
+	for (i = 0; i < 4; i++) if (s31_sm_ba_mask & (1U << i)) hal_agreement_del_rx_ba(i);
+	s31_sm_ba_mask = 0;
+	s31_sm_he_restore();
+	s31_sm_coex_restore();
+	s31_sm_bssid_filter_restore();
+	s31_sm_sniffer_restore();
+	for (i = 0; i < 5; i++) if (s31_sm_key_mask & (1U << i)) s31_sm_key_remove(i);
+	g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+	return 0;
+}
 static int s31_sm_stop(void)
 {
 	int rc;
-	unsigned int i;
-	if (s31_sm_active && s31_sm_tx_peer) {
-		struct s31_wifi_control tx_stop = { .operation = S31_WIFI_SOFTMAC_TX_BA_FLUSH };
-		memcpy(tx_stop.mac, s31_sm_tx_ap, 6);
-		s31_sm_tx_ba_control(&tx_stop);
-		tx_stop.operation = S31_WIFI_SOFTMAC_TX_PEER_DEL;
-		s31_sm_tx_ba_control(&tx_stop);
-	}
+	bool started = s31_wifi_start_requested || s31_sm_active;
 	if (s31_sm_active) {
-		g_osi_funcs_p->_mutex_lock(g_wifi_global_lock);
-		for (i = 0; i < 4; i++) if (s31_sm_ba_mask & (1U << i)) hal_agreement_del_rx_ba(i);
-		s31_sm_ba_mask = 0;
-		s31_sm_he_restore();
-		s31_sm_bssid_filter_restore();
-		s31_sm_sniffer_restore();
-		for (i = 0; i < 5; i++) if (s31_sm_key_mask & (1U << i)) s31_sm_key_remove(i);
-		g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
+		static struct s31_sm_wifi_ipc_config drain = { .fn = s31_sm_stop_in_pp };
+		/* Never wait for PP while holding the Wi-Fi resource mutex. */
+		rc = esp_wifi_ipc_internal(&drain, true);
+		if (rc) return rc;
 	}
 
 	if (s31_sm_active)
 		*s31_sm_rx_crypto_reg() = s31_sm_rx_crypto_saved;
 	s31_sm_active = false;
-	s31_sm_rx_view_enabled = false;
 	s31_sm_rx_ra_filter = false;
  s31_sm_rx_error_filter = false;
  s31_sm_rx_bssid_filter = false;
 	esp_wifi_set_promiscuous(false);
 	esp_wifi_set_promiscuous_rx_cb(NULL);
+	s31_sm_start_waiting = false;
+	if (started) {
+		xEventGroupClearBits(s31_wifi_lifecycle_events, S31_WIFI_EVENT_STOPPED);
+		s31_sm_stop_pending = true;
+	}
 	rc = esp_wifi_stop();
+	if (!rc && started && !(xEventGroupWaitBits(s31_wifi_lifecycle_events,
+			S31_WIFI_EVENT_STOPPED, pdTRUE, pdFALSE,
+			pdMS_TO_TICKS(2000)) & S31_WIFI_EVENT_STOPPED))
+		rc = ESP_ERR_TIMEOUT;
+	if (!rc && started) {
+		static struct s31_sm_wifi_ipc_config stopped = {
+			.fn = s31_sm_stopped_notifications_in_pp,
+		};
+		rc = esp_wifi_ipc_internal(&stopped, true);
+	}
 	if (!rc) {
+		s31_rtos_tx_pool_bind(NULL);
 		s31_wifi_start_requested = 0;
 		s31_wifi_start_complete = 0;
 		memset(s31_sm_flights, 0, sizeof(s31_sm_flights));
-		s31_sm_mac_ccmp_flights = 0;
+		s31_sm_key_pins_reset();
 		s31_sm_tx_peer = NULL;
 		s31_sm_tx_agg_flights = 0;
 		s31_sm_tx_ba = false;
@@ -675,37 +945,63 @@ static int s31_sm_stop(void)
 	}
 	return rc;
 }
+
 static int s31_sm_start(const struct s31_wifi_control *request)
 {
 	wifi_promiscuous_filter_t filter = {
 		.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_MISC,
 	};
-	unsigned int i;
 	int rc;
 
-	if (s31_sm_active || s31_wifi_start_requested)
+	if (s31_sm_active || s31_wifi_start_requested || s31_sm_stop_pending)
 		return ESP_ERR_INVALID_STATE;
+	if (s31_rtos_softmac_tx_copy(NULL) != S31_SOFTMAC_TX_BATCH_ABI)
+		return ESP_ERR_NOT_SUPPORTED;
+	/* Refuse an older kernel adapter before enabling the new wait reason. */
+	if (!s31_rtos_pp_notify_capable())
+		return ESP_ERR_NOT_SUPPORTED;
+	/* The native-only matched frontend consumes borrowed RX views before
+	 * return. Reject an old start contract before touching hardware rather
+	 * than retaining a second full-frame staging allocation/copy path. */
+	if (!(request->field & S31_SOFTMAC_START_RX_VIEW))
+		return ESP_ERR_NOT_SUPPORTED;
 	if (request->channel < 1 || request->channel > 11)
 		return ESP_ERR_INVALID_ARG;
+	/* ROM esf_buf_recycle(type1): 12-byte record, recycle word at +4. */
+	if (!s31_rtos_tx_pool_bind(g_lmac_cnt_ptr + 12 + 4))
+		return ESP_ERR_NOT_SUPPORTED;
+	if (!s31_rtos_mutex_tx_credit_bind(g_wifi_global_lock))
+		return ESP_ERR_INVALID_STATE;
 	rc = esp_wifi_set_mac(WIFI_IF_STA, request->mac);
 	if (!rc) rc = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
 		((request->field & 1) ? WIFI_PROTOCOL_11N : 0) |
 		((request->field & 2) ? WIFI_PROTOCOL_11AX : 0));
 	if (!rc) rc = esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20);
 	if (!rc) rc = esp_wifi_set_ps(WIFI_PS_NONE);
-	s31_linux_printf("[S31-SM] config rc=%d\n", rc);
+
 	if (!rc && !s31_sm_cb_registered) {
 		rc = ppRegisterTxCallback(s31_sm_tx_done, S31_SM_CB_INDEX, 0);
-		s31_linux_printf("[S31-SM] PP callback slot=%u rc=%d\n", S31_SM_CB_INDEX, rc);
+
 		if (!rc) s31_sm_cb_registered = true;
 	}
-	if (!rc) rc = esp_wifi_start();
-	s31_linux_printf("[S31-SM] esp_wifi_start rc=%d\n", rc);
 	if (!rc) {
+		xEventGroupClearBits(s31_wifi_lifecycle_events, S31_WIFI_EVENT_STARTED);
+		s31_wifi_start_complete = 0;
 		s31_wifi_start_requested = 1;
-		for (i = 0; i < 200 && !s31_wifi_start_complete; i++)
-			vTaskDelay(pdMS_TO_TICKS(10) ?: 1);
-		if (!s31_wifi_start_complete) rc = ESP_ERR_TIMEOUT;
+		s31_sm_start_waiting = true;
+		rc = esp_wifi_start();
+		if (rc) {
+			s31_wifi_start_requested = 0;
+			s31_sm_start_waiting = false;
+		}
+	}
+
+	if (!rc) {
+		if (!(xEventGroupWaitBits(s31_wifi_lifecycle_events,
+				S31_WIFI_EVENT_STARTED, pdTRUE, pdFALSE,
+				pdMS_TO_TICKS(2000)) & S31_WIFI_EVENT_STARTED))
+			rc = ESP_ERR_TIMEOUT;
+		s31_sm_start_waiting = false;
 	}
 	if (!rc) rc = esp_wifi_set_channel(request->channel, WIFI_SECOND_CHAN_NONE);
 	if (!rc) rc = esp_wifi_set_promiscuous_filter(&filter);
@@ -726,24 +1022,17 @@ static int s31_sm_start(const struct s31_wifi_control *request)
 		g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
 	}
 	if (!rc) {
-		s31_sm_tx_trace = s31_sm_rx_trace = s31_sm_done_trace = s31_sm_protected_trace = 0;
-		s31_sm_ht_done_trace = 0;
-		s31_sm_phy_trace = 0;
-		s31_sm_key_trace = s31_sm_key_error_trace = 0;
-		s31_sm_rx_view_enabled = !!(request->field & S31_SOFTMAC_START_RX_VIEW);
 		s31_sm_rx_ra_filter = !!(request->field & S31_SOFTMAC_START_RX_RA_FILTER);
-		s31_sm_rx_ra_filtered = 0;
+
   s31_sm_rx_error_filter = !!(request->field & S31_SOFTMAC_START_RX_DROP_ERRORS);
   s31_sm_rx_bssid_filter = !!(request->field & S31_SOFTMAC_START_RX_BSSID_FILTER);
-  s31_sm_rx_bssid_filtered = 0;
-  s31_sm_rx_errors_filtered = 0;
+
 		s31_sm_epoch = request->offset;
 		memcpy(s31_sm_mac, request->mac, sizeof(s31_sm_mac));
 		s31_sm_active = true;
 	}
 	else if (s31_wifi_start_requested) s31_sm_stop();
-	s31_linux_printf("[S31-SM] start result=%d complete=%d active=%d epoch=%u\n",
-			 rc, s31_wifi_start_complete, s31_sm_active, s31_sm_epoch);
+
 	return rc;
 }
 static int s31_sm_rx_ba(const struct s31_wifi_control *request)
@@ -764,8 +1053,7 @@ static int s31_sm_rx_ba(const struct s31_wifi_control *request)
 		s31_sm_ba_mask &= ~(1U << slot);
 	}
 	g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
-	s31_linux_printf("[S31-SM] RX BA op=%u slot=%u tid=%u ssn=%u window=%u\n",
-		request->operation, slot, request->total, request->offset, request->length);
+
 	return 0;
 }
 static int s31_sm_edca(const struct s31_wifi_control *request)
@@ -800,7 +1088,7 @@ static int s31_sm_rx_key(const struct s31_wifi_control *request)
 	/* A submitted MAC frame may still read its key at hardware enable.
 	 * Refuse a slot mutation until those flights drain; do not re-encrypt an
 	 * old PN with a newly installed key. Queued frames use a separate token. */
-	if (slot == 4 && s31_sm_mac_ccmp_flights) {
+	if (slot == 4 && s31_sm_key_pins_any()) {
 		g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
 		return ESP_ERR_INVALID_STATE;
 	}
@@ -836,7 +1124,6 @@ static int s31_sm_rx_key(const struct s31_wifi_control *request)
 		*s31_sm_rx_crypto_reg() = 0;
 	}
 	g_osi_funcs_p->_mutex_unlock(g_wifi_global_lock);
-	s31_linux_printf("[S31-SM] RX key probe op=%u slot=%u keyid=%u mask=%x\n",
-		request->operation, slot, request->offset, s31_sm_key_mask);
+
 	return 0;
 }

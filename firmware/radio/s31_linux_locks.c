@@ -6,8 +6,6 @@
 
 #include "s31_rtos/s31_rtos.h"
 
-#define S31_MUTEX_NORMAL 1
-#define S31_MUTEX_RECURSIVE 4
 #define S31_LOCK_SLOTS 32
 
 struct __lock __lock___libc_recursive_mutex;
@@ -61,13 +59,13 @@ static void *s31_lock_get(struct __lock *lock, uint8_t type)
 	return handle;
 }
 
-static void *s31_lock_find(struct __lock *lock)
+static struct s31_lock_entry *s31_lock_find(struct __lock *lock)
 {
 	unsigned int i;
 
 	for (i = 0; i < S31_LOCK_SLOTS; i++)
 		if (s31_locks[i].key == lock)
-			return s31_locks[i].handle;
+			return &s31_locks[i];
 	return NULL;
 }
 
@@ -85,16 +83,24 @@ static int s31_lock_take(struct __lock *lock, TickType_t timeout,
 	return xQueueSemaphoreTake(handle, timeout) == pdTRUE ? 0 : -1;
 }
 
+static void s31_lock_require(struct __lock *lock, uint8_t type)
+{
+    if (s31_lock_take(lock, portMAX_DELAY, type) < 0) {
+        /* A void libc acquire cannot grant an unprotected continuation. */
+        s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);
+        __builtin_unreachable();
+    }
+}
+
 static void s31_lock_give(struct __lock *lock)
 {
-	void *handle = s31_lock_find(lock);
-
-	if (!handle)
-		return;
-	if (s31_rtos_in_isr())
-		xQueueGiveFromISR(handle, NULL);
-	else
-		xQueueGiveMutexRecursive(handle);
+    struct s31_lock_entry *entry = s31_lock_find(lock);
+    if (!entry) return;
+    if (s31_rtos_in_isr()) xQueueGiveFromISR(entry->handle, NULL);
+    else if (entry->type == S31_MUTEX_RECURSIVE)
+        xQueueGiveMutexRecursive(entry->handle);
+    else
+        xQueueGenericSend(entry->handle, NULL, 0, S31_QUEUE_SEND_TO_BACK);
 }
 
 void _lock_init(_lock_t *lock)
@@ -137,16 +143,14 @@ void _lock_acquire(_lock_t *lock)
 {
 	if (lock && !*lock)
 		_lock_init(lock);
-	if (lock && *lock)
-		s31_lock_take(*lock, portMAX_DELAY, S31_MUTEX_NORMAL);
+	s31_lock_require(lock ? *lock : NULL, S31_MUTEX_NORMAL);
 }
 
 void _lock_acquire_recursive(_lock_t *lock)
 {
 	if (lock && !*lock)
 		_lock_init_recursive(lock);
-	if (lock && *lock)
-		s31_lock_take(*lock, portMAX_DELAY, S31_MUTEX_RECURSIVE);
+	s31_lock_require(lock ? *lock : NULL, S31_MUTEX_RECURSIVE);
 }
 
 int _lock_try_acquire(_lock_t *lock)
@@ -192,11 +196,11 @@ void __retarget_lock_close(_LOCK_T lock) { _lock_close(&lock); }
 void __retarget_lock_close_recursive(_LOCK_T lock) { _lock_close(&lock); }
 void __retarget_lock_acquire(_LOCK_T lock)
 {
-	s31_lock_take(lock, portMAX_DELAY, S31_MUTEX_NORMAL);
+	s31_lock_require(lock, S31_MUTEX_NORMAL);
 }
 void __retarget_lock_acquire_recursive(_LOCK_T lock)
 {
-	s31_lock_take(lock, portMAX_DELAY, S31_MUTEX_RECURSIVE);
+	s31_lock_require(lock, S31_MUTEX_RECURSIVE);
 }
 int __retarget_lock_try_acquire(_LOCK_T lock)
 {

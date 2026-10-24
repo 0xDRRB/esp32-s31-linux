@@ -31,9 +31,10 @@ module_loaded()
 radio_ready()
 {
     bound=0
-    for health in /sys/bus/platform/drivers/esp32s31-radio/*/radio_health; do
-        [ -r "$health" ] || continue
-        grep -Eq '(^| )state=2( |$)' "$health" || continue
+    # Registered frontends are published only after the native core is ready.
+    # Check the driver binding directly; no diagnostic sysfs ABI is needed.
+    for device in /sys/bus/platform/drivers/esp32s31-radio/*; do
+        [ -L "$device/driver" ] || continue
         bound=1
         break
     done
@@ -117,7 +118,7 @@ start_radio()
 	}
 	sync
 	[ ! -w /proc/sys/vm/drop_caches ] || echo 3 > /proc/sys/vm/drop_caches
-	/usr/sbin/s31-modload "$module_file" "mode=$mode" direct_hci=1 || return 1
+	/usr/sbin/s31-modload "$module_file" "mode=$mode" || return 1
     # Probe may fail even when module registration succeeded. Inspect binding
     # and local frontends; RF association/controller opening is a later stage.
     attempt=0

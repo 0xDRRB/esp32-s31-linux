@@ -8,25 +8,32 @@
  * bridge declared in s31_rtos.h.
  */
 #include <stdint.h>
+#include <stdarg.h>
+#include <errno.h>
 #include <string.h>
 #include "s31_rtos.h"
 
-
+/* Fixed-argument Linux logging import keeps arbitrary printf stack tails
+ * behind a stable va_list pointer while TP normalization uses a call frame. */
+extern void s31_linux_vprintf(const char *fmt, void *arguments);
+_Static_assert(sizeof(va_list) == sizeof(void *), "RV32 va_list import ABI");
+void s31_linux_printf(const char *fmt, ...)
+{
+    va_list arguments;
+    va_start(arguments, fmt);
+    s31_linux_vprintf(fmt, arguments);
+    va_end(arguments);
+}
 
 uint32_t s31_rtos_isr_depth;
 
 static volatile uint32_t s31_scheduler_started;
-static volatile uint32_t s31_orphan_critical_depth;
-static volatile uint32_t s31_orphan_critical_flags;
-static uint32_t s31_task_delete_count;
-static uint32_t s31_task_priority_set_count;
-/* Linux's serialized radio worker executes the deferred Wi-Fi ISR, esp_timer
- * callbacks, and direct data-path calls.  Native FreeRTOS always has a
- * pxCurrentTCB in those contexts (an ISR observes the interrupted task), while
- * the kthread bridge previously returned NULL.  Keep a stable internal-SRAM
- * identity for all non-compatibility worker entries so mutex ownership and
- * pthread TLS retain FreeRTOS semantics. */
-static struct s31_tcb s31_foreign_tcb;
+static uint32_t s31_stack_minimum = 8192;
+/* Direct/deferred radio IRQs and the exclusive pre-task bootstrap need an
+ * auxiliary ABI identity, never a schedulable or general foreign-thread TCB.
+ * The kernel proves this role before allowing a missing native cookie. */
+static struct s31_tcb s31_aux_tcb;
+static void s31_rtos_task_finalize(void *cookie);
 
 /* --- radio heap (heap_caps in the same world) --- */
 void *s31_rtos_malloc(uint32_t size)
@@ -44,13 +51,10 @@ void *s31_rtos_malloc(uint32_t size)
  */
 static void *s31_rtos_stack_malloc(uint32_t size)
 {
-	 extern void *heap_caps_malloc(uint32_t size, uint32_t caps);
-
-	/* The caller has already expanded the advertised stack size to include
-	 * the Linux bridge headroom.  Keeping that adjustment outside this
-	 * allocator is essential: the trampoline must put SP at the end of the
-	 * complete allocation, not at the end of the smaller IDF request. */
-	return heap_caps_malloc(size, 0x804 /* INTERNAL | 8BIT */);
+	/* Linux owns exact aligned stack extents and joins their last reference.
+	 * No ordinary heap header occupies the previous stack's tail. */
+	return (void *)s31_linux_sync_owner((void *)(uintptr_t)size,
+					 S31_SYNC_STACK_ALLOC);
 }
 
 void s31_rtos_use_internal_stacks(void)
@@ -67,53 +71,46 @@ void s31_rtos_free(void *ptr)
 }
 
 /* --- critical sections --- */
+/* Linux owns the physical invocation, IRQ flags and object recursion. The
+ * compact managed TCB retains only the logical ABI hint; foreign callers must
+ * never use the shared compatibility TCB as their physical lock identity. */
 void vPortEnterCritical(void)
 {
-	struct s31_tcb *t = s31_rtos_current();
-
-	if (!t) {
-		if (s31_orphan_critical_depth++ == 0)
-			s31_orphan_critical_flags = s31_linux_critical_enter();
-		return;
-	}
-	if (t->critical_depth++ == 0)
-		t->critical_flags = s31_linux_critical_enter();
+    uint32_t flags = s31_linux_critical_enter();
+    struct s31_tcb *t = s31_rtos_current();
+    if (t && t->linux_task) { t->critical_depth++; t->critical_flags = flags; }
 }
-
 void vPortExitCritical(void)
 {
-	struct s31_tcb *t = s31_rtos_current();
-
-	if (!t) {
-		if (s31_orphan_critical_depth && --s31_orphan_critical_depth == 0)
-			s31_linux_critical_exit(s31_orphan_critical_flags);
-		return;
-	}
-	if (t->critical_depth && --t->critical_depth == 0)
-		s31_linux_critical_exit(t->critical_flags);
+    struct s31_tcb *t = s31_rtos_current();
+    if (t && t->linux_task) {
+        if (!t->critical_depth) s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);
+        t->critical_depth--;
+    }
+    s31_linux_critical_exit(0);
 }
-
-/* IDF's SMP port spells the same critical-section contract through a
- * portMUX pointer. Blob execution is already serialized by the Linux gate;
- * retain FreeRTOS nesting/IRQ semantics through the per-task implementation
- * above and treat the mux storage as opaque. */
+struct s31_mux_enter_args { void *mux; int32_t timeout_cycles; };
 BaseType_t xPortEnterCriticalTimeout(void *mux, BaseType_t timeout)
 {
-	(void)mux;
-	(void)timeout;
-	vPortEnterCritical();
-	return pdTRUE;
+    struct s31_mux_enter_args args = { mux, timeout };
+    BaseType_t result = s31_linux_sync_owner(&args, S31_SYNC_MUX_ENTER) ? pdTRUE : pdFALSE;
+    struct s31_tcb *t = s31_rtos_current();
+    if (result && t && t->linux_task) t->critical_depth++;
+    return result;
 }
-
 void vPortExitCriticalMultiCore(void *mux)
 {
-	(void)mux;
-	vPortExitCritical();
+    struct s31_tcb *t = s31_rtos_current();
+    if (t && t->linux_task) {
+        if (!t->critical_depth) s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);
+        t->critical_depth--;
+    }
+    (void)s31_linux_sync_owner(mux, S31_SYNC_MUX_EXIT);
 }
 
 BaseType_t s31_rtos_in_isr(void)
 {
-	return s31_rtos_isr_depth > 0 ? pdTRUE : pdFALSE;
+	return s31_rtos_isr_depth > 0 || s31_linux_in_interrupt() ? pdTRUE : pdFALSE;
 }
 
 BaseType_t xPortInIsrContext(void)
@@ -125,7 +122,8 @@ BaseType_t s31_rtos_can_yield(void)
 {
 	struct s31_tcb *t = s31_rtos_current();
 
-	return !s31_rtos_in_isr() && (!t || t->critical_depth == 0);
+	return !s31_rtos_in_isr() && (!t || !t->linux_task || !t->critical_depth) &&
+        !s31_linux_sync_owner(NULL, S31_SYNC_CRITICAL_DEPTH);
 }
 
 void vPortYieldFromISR(void)
@@ -160,19 +158,23 @@ void s31_rtos_hard_tick(void)
 void s31_rtos_tick(void)
 {
 	extern void s31_linux_timers_tick(void);
-	extern void s31_radio_coex_worker_tick(void);
 
-	/* Callback execution is serialized under the blob gate in the radio
-	 * worker.  Time is read from the Linux bridge in s31_linux_timer.c. */
+	/* The native dispatcher owns task callbacks; its timer lease serializes
+	 * callbacks independently of other radio execution. */
 	s31_linux_timers_tick();
-	s31_radio_coex_worker_tick();
 }
 
 struct s31_tcb *s31_rtos_current(void)
 {
 	struct s31_tcb *t = s31_linux_current_cookie();
 
-	return t ? t : &s31_foreign_tcb;
+	if (t)
+		return t;
+	if (!s31_linux_sync_owner(NULL, S31_SYNC_AUX_CONTEXT)) {
+        s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);
+        return NULL;
+    }
+    return &s31_aux_tcb;
 }
 
 UBaseType_t xTaskGetSchedulerState(void)
@@ -184,19 +186,10 @@ UBaseType_t xTaskGetSchedulerState(void)
 /* --- Linux-backed tasks --- */
 static void s31_rtos_task_entry(void *arg)
 {
-	struct s31_tcb *t = arg;
-	int i;
+    struct s31_tcb *t = arg;
 
-	t->entry(t->arg);
-	if (!t->tls_cleaned) {
-		t->tls_cleaned = 1;
-		for (i = 0; i < 4; i++)
-			if (t->tls_dtor[i])
-				t->tls_dtor[i](i, t->tls[i]);
-	}
-	/* The Linux trampoline still owns this TCB until the payload has returned
-	 * to s31_linux_task_main().  In particular, the self-delete path escapes
-	 * through that trampoline and must not leave it dereferencing freed SRAM. */
+    t->entry(t->arg);
+    /* Normal/self/forced exit all converge on Linux's target finalizer. */
 }
 
 BaseType_t xTaskCreatePinnedToCore(void (*task_func)(void *), const char *name,
@@ -208,7 +201,17 @@ BaseType_t xTaskCreatePinnedToCore(void (*task_func)(void *), const char *name,
 	void *linux_task;
 	uint32_t stack_size;
 
+	/* FreeRTOS task creation has no FromISR variant.  Reject before
+	 * touching the TCB, native waiters, payload stack or output handle.
+	 * The payload depth alone cannot identify a depth-zero Linux IRQ. */
+	if (s31_rtos_in_isr() || s31_linux_in_interrupt())
+		return pdFAIL;
 	if (!task_func || !stack_depth)
+		return pdFAIL;
+	/* Retired kernel stack references must join before allocating another
+	 * aligned extent. Reclaiming only inside the factory is too late when
+	 * this allocation itself exhausts or fragments the SRAM pool. */
+	if (!s31_linux_sync_owner(NULL, S31_SYNC_STACK_RECLAIM))
 		return pdFAIL;
 	t = s31_rtos_malloc(sizeof(*t));
 	if (!t)
@@ -221,7 +224,8 @@ BaseType_t xTaskCreatePinnedToCore(void (*task_func)(void *), const char *name,
 	t->entry = task_func;
 	t->arg = param;
 	t->priority = prio;
-	t->core_id = core_id;
+	/* Physical and public task affinity agree with the core0 runtime. */
+	t->core_id = 0;
 	t->notify_context = s31_linux_sync_create();
 	t->suspend_context = s31_linux_sync_create();
 	if (!t->notify_context || !t->suspend_context) {
@@ -235,13 +239,10 @@ BaseType_t xTaskCreatePinnedToCore(void (*task_func)(void *), const char *name,
 	/* ESP-IDF, unlike upstream FreeRTOS, specifies this in bytes.  The
 	 * execution stack must live in internal SRAM (see s31_rtos_stack_malloc). */
 	stack_size = (stack_depth + 15U) & ~15U;
-	/* A compatibility task calls Linux wait/schedule code on this same HP-SRAM
-	 * stack.  Previously s31_rtos_stack_malloc() silently allocated 8 KiB but
-	 * task->stack_size retained (for example) Wi-Fi's 3584-byte request, so the
-	 * trampoline placed SP in the middle of the allocation and exposed only
-	 * 3584 bytes to downward-growing kernel frames. */
-	if (stack_size < 8192)
-		stack_size = 8192;
+	/* This is the actual Linux task stack. Linux negotiates its size and
+	 * alignment before any task creation; there is no second wait stack. */
+	if (stack_size < s31_stack_minimum)
+		stack_size = s31_stack_minimum;
 	t->stack_base = s31_rtos_stack_malloc(stack_size);
 	if (!t->stack_base) {
 		s31_linux_sync_destroy(t->notify_context);
@@ -250,17 +251,16 @@ BaseType_t xTaskCreatePinnedToCore(void (*task_func)(void *), const char *name,
 		return pdFAIL;
 	}
 	t->stack_size = stack_size;
-	linux_task = s31_linux_task_create(s31_rtos_task_entry, t->name,
+	linux_task = s31_linux_task_create_finalized(s31_rtos_task_entry, t->name,
 					   stack_size, t->stack_base, t, prio, t,
-					   core_id);
+					   core_id, s31_rtos_task_finalize, &t->linux_task);
 	if (!linux_task) {
-		s31_rtos_free(t->stack_base);
+		s31_linux_sync_owner(t->stack_base, S31_SYNC_STACK_FREE);
 		s31_linux_sync_destroy(t->notify_context);
 		s31_linux_sync_destroy(t->suspend_context);
 		s31_rtos_free(t);
 		return pdFAIL;
 	}
-	t->linux_task = linux_task;
 	if (task_handle)
 		*(void **)task_handle = t;
 	s31_scheduler_started = 1;
@@ -272,12 +272,119 @@ void *xTaskGetCurrentTaskHandle(void)
 	return s31_rtos_current();
 }
 
+/* Task-owned resource cleanup, executed by the task's final continuation.
+ * Push/pop are owner-only; other tasks request stop but never run this chain.
+ * Cleanup callbacks must not block or invoke a nonlocal task exit.
+ */
+BaseType_t s31_rtos_cleanup_push(struct s31_task_cleanup *cleanup)
+{
+    struct s31_tcb *t = s31_rtos_current();
+
+    if (!cleanup || !cleanup->release || !t ||
+        (!t->linux_task && !s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FOREIGN_TOKEN)))
+        return pdFALSE;
+    cleanup->owner = t;
+    cleanup->next = t->cleanups;
+    t->cleanups = cleanup;
+    return pdTRUE;
+}
+
+void s31_rtos_cleanup_pop(struct s31_task_cleanup *cleanup)
+{
+    struct s31_tcb *t = cleanup->owner;
+    struct s31_task_cleanup **link;
+
+    if (!t)
+        return;
+    for (link = &t->cleanups; *link; link = &(*link)->next) {
+        if (*link == cleanup) {
+            *link = cleanup->next;
+            break;
+        }
+    }
+    cleanup->owner = NULL;
+    cleanup->next = NULL;
+}
+
+void s31_rtos_cleanup_drain(struct s31_tcb *t)
+{
+    while (t->cleanups) {
+        struct s31_task_cleanup *cleanup = t->cleanups;
+
+        t->cleanups = cleanup->next;
+        cleanup->owner = NULL;
+        cleanup->next = NULL;
+        cleanup->release(cleanup);
+    }
+    if ((t->native_call.state))
+        s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);
+}
+
+/* Invoked by this task's final Linux continuation on a fresh SRAM stack,
+ * while current-cookie, init_mm, blob gate and FP identity still belong to it.
+ * Generic TLSP callbacks run here; a pthread callback retains its outer TLS
+ * list while calling/repopulating POSIX destructors, so clear pointers later. */
+static void s31_rtos_task_finalize(void *cookie)
+{
+    struct s31_tcb *t = cookie;
+    int i, pending;
+
+    if (!t || t != s31_rtos_current() || !t->linux_task || t->tls_finalizing) {
+        s31_linux_task_finalize_report(-1);
+        return;
+    }
+    if (t->tls_cleaned) {
+        s31_linux_task_finalize_report(0);
+        return;
+    }
+    t->tls_finalizing = 1;
+    /* Linux retired this target's physical body critical ownership before
+     * reentering the fresh callback span. Its abandoned logical nesting
+     * must not suppress a destructor's new short critical/IRQ fence. */
+    t->critical_depth = 0;
+    t->critical_flags = 0;
+    s31_rtos_cleanup_drain(t);
+    t->tls_cleaned = 1;
+    do {
+        for (i = 0; i < 4; ++i) {
+            while (t->tls_dtor[i]) {
+                void (*dtor)(int, void *) = t->tls_dtor[i];
+                void *value = t->tls[i];
+
+                /* Claim this registration exactly once before callback reentry.
+                 * Owner-installed replacement registrations remain observable. */
+                t->tls_dtor[i] = NULL;
+                dtor(i, value);
+                if (!t->tls_dtor[i] && t->tls[i] == value)
+                    t->tls[i] = NULL;
+            }
+        }
+        pending = 0;
+        for (i = 0; i < 4; ++i)
+            pending |= t->tls_dtor[i] != NULL;
+    } while (pending);
+    s31_rtos_cleanup_drain(t); /* retire destructor-created ownership too */
+    /* Body-owned nesting was retired before this phase. A callback must
+     * balance its own newly acquired logical span, including cancellation
+     * returns. Never disguise a returned live/suspended lock by zeroing it. */
+    if (t->critical_depth) {
+        s31_linux_task_finalize_report(-1);
+        return;
+    }
+    memset(t->tls, 0, sizeof(t->tls));
+    t->tls_finalizing = 0;
+    s31_linux_task_finalize_report(0);
+}
+
 void s31_rtos_task_release(void *cookie)
 {
 	struct s31_tcb *t = cookie;
 
 	if (!t)
 		return;
+	/* Wait helpers finish/cancel their Linux waiter before a forced exit.
+     * Drain payload resources before TCB contexts or memory disappear. */
+    s31_rtos_cleanup_drain(t);
 	if (t->notify_context)
 		s31_linux_sync_destroy(t->notify_context);
 	if (t->suspend_context)
@@ -461,21 +568,20 @@ void vTaskSuspend(void *task)
 
 void vTaskPrioritySet(void *task, UBaseType_t priority)
 {
-	struct s31_tcb *t = task ? task : s31_rtos_current();
-	if (t) {
-		t->priority = priority;
-		s31_linux_task_set_priority(t->linux_task, priority);
-		if (++s31_task_priority_set_count <= 32)
-			s31_linux_printf("[S31] vTaskPrioritySet #%u task=%s prio=%u\n",
-				       s31_task_priority_set_count, t->name, priority);
-	}
+    struct s31_tcb *t = task ? task : s31_rtos_current();
+    if (!t || priority > 31) return;
+    if (t->linux_task)
+        s31_linux_task_set_priority(t->linux_task, priority, 0);
+    /* IRQ/bootstrap identity has no scheduler role to mutate. */
 }
 
 UBaseType_t uxTaskPriorityGet(void *task)
 {
-	struct s31_tcb *t = task ? task : s31_rtos_current();
-
-	return t ? t->priority : 0;
+    struct s31_tcb *t = task ? task : s31_rtos_current();
+    if (!t) return 0;
+    if (t->linux_task)
+        return s31_linux_sync_owner(t->linux_task, S31_SYNC_NATIVE_EFFECTIVE);
+    return t->priority; /* Fixed IRQ/bootstrap identity level. */
 }
 
 BaseType_t xTaskGetCoreID(void *task)
@@ -502,20 +608,15 @@ void *xTaskGetCurrentTaskHandleForCore(BaseType_t core)
 void vTaskDelete(void *task)
 {
 	struct s31_tcb *t = task ? task : s31_rtos_current();
-	int i;
 
 	if (!t)
 		return;
-	if (++s31_task_delete_count <= 32)
-		s31_linux_printf("[S31] vTaskDelete #%u task=%p current=%p name=%s linux=%p\n",
-			       s31_task_delete_count, t, s31_rtos_current(), t->name,
-			       t->linux_task);
-	if (!t->tls_cleaned) {
-		t->tls_cleaned = 1;
-		for (i = 0; i < 4; i++)
-			if (t->tls_dtor[i])
-				t->tls_dtor[i](i, t->tls[i]);
-	}
+
+    /* Recursive self-delete from a TLSP callback must not abandon the
+     * remaining final continuation. Ordinary delete only requests stop. */
+    if (t == s31_rtos_current() && t->tls_finalizing) {
+        return;
+    }
 	if (t == s31_rtos_current()) {
 		s31_linux_task_exit_current();
 		return;
@@ -540,17 +641,36 @@ void vTaskSetThreadLocalStoragePointerAndDelCallback(void *task, int index,
 
 	if (!t || index < 0 || index >= 4)
 		return;
+    if (dtor && !t->linux_task) {
+        s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);
+        return;
+    }
 	t->tls[index] = value;
 	t->tls_dtor[index] = dtor;
 }
 
 void s31_rtos_init(void)
 {
-	memset(&s31_foreign_tcb, 0, sizeof(s31_foreign_tcb));
-	strncpy(s31_foreign_tcb.name, "radio-worker",
-		S31_TASK_NAME_LEN - 1);
-	s31_foreign_tcb.priority = 24;
+    /* Module data is not copied/zeroed by runtime_init.  The old registry
+     * and its lock belonged to the prior, now-reclaimed SRAM pool. */
+    /* This init runs in the exclusive non-sleeping bootstrap. Refuse an
+     * adapter without the new explicit auxiliary-role contract. */
+    if (!s31_linux_sync_owner(NULL, S31_SYNC_AUX_CONTEXT))
+        s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);
+    s31_rtos_event_runtime_reset();
+    s31_rtos_queue_runtime_reset();
+    s31_rtos_timer_runtime_reset();
+    if (!s31_linux_sync_owner(NULL, S31_SYNC_NATIVE_MODE))
+        s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);
+    uintptr_t minimum = s31_linux_sync_owner(NULL, S31_SYNC_STACK_RAW_MINIMUM);
+    if (minimum < 4096 || minimum > UINT32_MAX || (minimum & (minimum - 1)))
+        s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);
+    s31_stack_minimum = (uint32_t)minimum;
+    memset(&s31_aux_tcb, 0, sizeof(s31_aux_tcb));
+    strncpy(s31_aux_tcb.name, "radio-irq-boot", S31_TASK_NAME_LEN - 1);
+    s31_aux_tcb.priority = 24;
+    /* Native scheduling and independent IRQ entry bank the relocated cell. */
+	s31_linux_sync_owner(&errno, S31_SYNC_ERRNO_REGISTER);
 	s31_scheduler_started = 0;
 	s31_rtos_isr_depth = 0;
-	s31_orphan_critical_depth = 0;
 }

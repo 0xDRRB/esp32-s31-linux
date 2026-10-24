@@ -28,6 +28,13 @@ def undefined_symbols(nm: str, elf: pathlib.Path) -> list[str]:
     return sorted(symbols)
 
 
+# Keep the payload ABI name while binding operations that may sleep to their
+# Linux-stack adapter. The underlying core symbol remains callable by it.
+IMPORT_TARGETS = {
+    "s31_linux_pmu_reclaim_after_radio_init": "s31_linux_pmu_reclaim_bridge",
+}
+
+
 def render(symbols: list[str], source: pathlib.Path,
            linked_symbols: set[str]) -> str:
     lines = [
@@ -45,7 +52,7 @@ def render(symbols: list[str], source: pathlib.Path,
         lines.extend(
             [
                 f"\t.long .Ls31_fw_import_name_{index}",
-                f"\t.long {symbol}" if symbol in linked_symbols else "\t.long 0",
+                f"\t.long {IMPORT_TARGETS.get(symbol, symbol)}" if symbol in linked_symbols else "\t.long 0",
             ]
         )
     lines.extend(

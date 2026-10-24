@@ -24,7 +24,7 @@ from tools.build.toolchain_identity import identify as toolchain_identity
 MAGIC = 0x58313353  # S31X
 BASE = 0xBE06E000
 HEADER_SIZE = 4096
-SLOT_SIZE = 0x180000
+SLOT_SIZE = 0x1C0000
 RAM_SIZE = 40960
 # Leave a gap after the 4 MiB flash vmalloc reservation and its guard page.
 WIFI_IRAM_BASE = 0xBE420000
@@ -39,11 +39,10 @@ EXPORTS = (
     's31_radio_wifi_try_send_interface', 's31_radio_wifi_read_mac',
     's31_radio_wifi_clock_enable', 's31_radio_wifi_clock_disable',
     's31_radio_wifi_try_send', 's31_rtos_init', 's31_rtos_tick',
-    's31_linux_timer_next_due_us', 's31_rtos_hard_tick', 's31_rtos_free',
+    's31_linux_timer_next_deadline_ns', 's31_rtos_hard_tick', 's31_rtos_free',
     's31_rtos_task_release', 'xTaskCreatePinnedToCore', 's31_rtos_isr_depth',
 )
 EMPTY_CLOCK_IMPORTS = frozenset(('_esp_libc_clock_array_start', '_esp_libc_clock_array_end'))
-
 
 class Elf:
     def __init__(self, path: Path):
@@ -70,7 +69,6 @@ class Elf:
                 name = names[n:names.find(b'\0', n)].decode()
                 if name:
                     self.symbols[name] = (v, size, info, idx)
-
 
 def select_iram_sections(payload, requested):
     """Select whole executable input sections; report co-resident functions too."""
@@ -100,10 +98,8 @@ def select_iram_sections(payload, requested):
                                             if sym[3] == idx and sym[2] & 15 == 2)))
     return report
 
-
 def run(*args):
     subprocess.run([str(a) for a in args], check=True)
-
 
 def input_identity(args):
     root = Path(__file__).resolve().parents[2]
@@ -119,7 +115,6 @@ def input_identity(args):
     identity = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()}
     identity['toolchain'] = toolchain_identity(files['tool_gcc'])['sha256']
     return identity
-
 
 def build(args):
     identity = input_identity(args)
@@ -146,9 +141,10 @@ def build(args):
               if line.strip() and not line.startswith('#')}
     # Fixed production placement; missing targets fail rather than fall back to flash.
     manifest = Path(__file__).resolve().parents[2] / 'firmware/radio/wifi_sram_symbols.txt'
+    payload = Elf(args.payload)
     requested = sorted(set(line.split('#', 1)[0].strip()
                            for line in manifest.read_text().splitlines()) - {''})
-    selection = select_iram_sections(Elf(args.payload), requested)
+    selection = select_iram_sections(payload, requested)
     keep_iram_symbols = [n for rec in selection for n in rec['functions']]
     # Drop unused undefined symbols before generating the binding contract.
     stripped = out / 'radio-xip-input.o'
@@ -166,7 +162,7 @@ def build(args):
     abi = payload.symbols['s31_radio_fw_abi_version']
     abi_section = payload.sections[abi[3]]
     if abi[1] != 4 or struct.unpack_from('<I', payload.data,
-            abi_section[4] + abi[0])[0] != 1:
+            abi_section[4] + abi[0])[0] != 2:
         raise ValueError('unsupported radio payload ABI')
     for name in EXPORTS[:-1]:
         if payload.symbols[name][2] & 15 != 2:
@@ -186,7 +182,22 @@ def build(args):
     for i, name in enumerate(functions):
         asm += [f'.globl {name}', f'.type {name},@function', f'{name}:',
                 f'lui t0,%hi(__xip_import_slots+{i * 4})',
-                f'lw t0,%lo(__xip_import_slots+{i * 4})(t0)', 'jr t0']
+                f'lw t0,%lo(__xip_import_slots+{i * 4})(t0)',
+                'j __s31_import_tp_stack2' if name == 's31_linux_task_create_finalized'
+                else 'j __s31_import_tp_guard']
+    # All current imports use register arguments except finalized task
+    # creation (ten XLEN words). Logging passes a va_list pointer instead of
+    # an unbounded variadic tail. malloc_prefer ignores its preference tail
+    # in the current all-SRAM allocator. Preserve real ABI stack arguments
+    # only on a clobbered-TP slow path; never read beyond the caller's args.
+    asm += ['.type __s31_import_tp_guard,@function', '__s31_import_tp_guard:',
+            'csrr t1,sscratch', 'beq tp,t1,3f', 'addi sp,sp,-16', 'j 2f',
+            '.type __s31_import_tp_stack2,@function', '__s31_import_tp_stack2:',
+            'csrr t1,sscratch', 'beq tp,t1,3f', 'addi sp,sp,-16',
+            'lw t2,16(sp)', 'sw t2,0(sp)', 'lw t2,20(sp)', 'sw t2,4(sp)',
+            '2:', 'sw ra,12(sp)', 'sw tp,8(sp)', 'mv tp,t1',
+            'jalr t0', 'lw tp,8(sp)', 'lw ra,12(sp)', 'addi sp,sp,16', 'ret',
+            '3:', 'jr t0']
     asm += ['.section .xip_import_slots,"aw",@progbits', '.balign 4',
             '.globl __xip_import_slots', '__xip_import_slots:', f'.zero {len(functions) * 4}',
             '.section .xip_vectors,"aw",@progbits', '.balign 4',
@@ -266,7 +277,7 @@ def build(args):
     # Header CRC covers metadata (including body CRC) with header CRC zeroed.
     # No temporary full-image copy is needed on the device.
     header = bytearray(HEADER_SIZE)
-    fields = [MAGIC, 2, 1, size, BASE, ram, RAM_SIZE, data_offset, data_size,
+    fields = [MAGIC, 2, 2, size, BASE, ram, RAM_SIZE, data_offset, data_size,
               sym('__xip_bss_start') - ram, bss_size,
               sym('_mtvt_table') - ram, len(functions), len(EXPORTS),
               zlib.crc32(body), 0]
@@ -307,7 +318,6 @@ def build(args):
     args.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps({k: v for k, v in report.items() if not isinstance(v, (dict, list))}))
 
-
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--prefix', required=True)
@@ -317,7 +327,6 @@ def main():
     p.add_argument('--imports', required=True, type=Path)
     p.add_argument('--output', required=True, type=Path)
     build(p.parse_args())
-
 
 if __name__ == '__main__':
     main()

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause
-"""Demote the radio closure's serialized picolibc errno TLS to module data."""
+"""Relocate picolibc errno to the native gate-swapped per-owner cell.
+
+The driver registers this cell and checkpoints it for every task/window.
+These relocations alone do not provide TLS and do not permit gate removal.
+"""
 
 import os
 import struct

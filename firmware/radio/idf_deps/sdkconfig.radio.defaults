@@ -10,11 +10,8 @@ CONFIG_SPIRAM_SPEED_250M=y
 CONFIG_SPIRAM_BOOT_HW_INIT=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MEMMAP=y
-# Match the native A2DP/Wi-Fi coexistence topology: two FreeRTOS cores.  The
-# compatibility bridge preserves each task's requested affinity and reports
-# its executing HP hart; the Linux blob gate still serializes unsafe closed
-# payload sections while a task is blocked, exactly where the native scheduler
-# may hand work to its other core.
+# Retain the two-core SDK ABI. Native Linux radio tasks are CPU0-owned;
+# Linux networking/peripheral service uses CPU1. No global vendor gate.
 # CONFIG_FREERTOS_UNICORE is not set
 # Keep the radio-only dependency build on the legacy local data path.
 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=y
@@ -59,13 +56,30 @@ CONFIG_BT_CONTROLLER_ENABLED=y
 # BLE-only controllers cannot carry AVDTP media or AVRCP signalling.
 # CONFIG_BTDM_CTRL_MODE_BLE_ONLY is not set
 CONFIG_BTDM_CTRL_MODE_BTDM=y
+# Reserve one native HCI SCO/eSCO link. IDF's zero-connection default creates
+# no synchronous TX pool and cannot qualify the native SCO ownership path.
+CONFIG_BT_CTRL_BR_EDR_MAX_SYNC_CONN=1
+CONFIG_BT_CTRL_BR_EDR_SYNC_TX_BUF_NB=4
+CONFIG_BT_CTRL_BR_EDR_SYNC_RX_BUF_NB=4
+CONFIG_BT_CTRL_BR_EDR_SCO_DATA_PATH_HCI=y
 # CONFIG_BT_BLUEDROID_ENABLED is not set
 # CONFIG_BT_NIMBLE_ENABLED is not set
 # The native coexistence benchmark leaves controller sleep disabled.  Keep the
 # same policy while validating Linux so sleep entry/exit cannot alter the RF
 # arbitration timing.
 # CONFIG_BT_CTRL_SLEEP_ENABLE is not set
+# Recorded stock-IDF performance configuration, used in every native mode.
+# Keep real HCI credits at full depth rather than a BT-only performance knob.
+CONFIG_BT_CTRL_BR_EDR_ACLU_TX_BUF_NB=10
+CONFIG_BT_CTRL_BR_EDR_DYNAMIC_ACLU_TX_BUF_NB=0
+CONFIG_BT_CTRL_BR_EDR_ACLU_RX_BUF_NB=8
 
 # Preserve all radio features, optimize the source-built IDF closure for size.
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # CONFIG_COMPILER_OPTIMIZATION_PERF is not set
+
+# The native radio uses one global WARN level. Per-tag lookup adds an unused
+# mutex/cache and refuses logs in IRQ context; keep the global runtime level.
+CONFIG_LOG_TAG_LEVEL_IMPL_NONE=y
+# CONFIG_LOG_TAG_LEVEL_IMPL_CACHE_AND_LINKED_LIST is not set
+# CONFIG_LOG_TAG_LEVEL_IMPL_LINKED_LIST is not set
