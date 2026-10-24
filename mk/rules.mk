@@ -16,14 +16,14 @@ doctor:
 fetch: download toolchain-fetch btstack-source fetch-rootfs
 build: resolved-config check-layout uboot linux rootfs radio-image
 all: image
-check: check-host check-docs check-dt
+check: check-layout check-docs check-dt
 check-artifacts:
 	python3 $(ROOT)/tools/release/manifest.py --output-root "$(BUILD_DIR)" --verify "$(IMAGES_DIR)/build-manifest.json"
 radio-fs: radio-image
 flash-image: image
 initramfs: rootfs
 bootloader: uboot
-$(BUILD_DIR) $(IMAGES_DIR) $(GENERATED_DIR) $(STAGING_DIR) $(REPORTS_DIR) $(OPENSBI_OUT) $(LINUX_OUT) $(UBOOT_OUT) $(BUILDROOT_OUT) $(COREMARK_OUT) $(RADIO_OUT):
+$(BUILD_DIR) $(IMAGES_DIR) $(GENERATED_DIR) $(STAGING_DIR) $(REPORTS_DIR) $(OPENSBI_OUT) $(LINUX_OUT) $(UBOOT_OUT) $(BUILDROOT_OUT) $(RADIO_OUT):
 	mkdir -p $@
 
 .PHONY: resolved-config

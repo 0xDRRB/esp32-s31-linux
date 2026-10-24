@@ -272,7 +272,19 @@ xz --check=crc32 --lzma2=dict=64KiB -f "${target_dir}/usr/lib/s31-radio/esp32s31
 rm -f "${target_dir}/usr/lib/s31-radio/s31-dma-ccm-net.ko.xz" \
 	"${target_dir}/etc/esp32-conf/softmac.conf"
 
-required_runtime='usr/sbin/s31-btstack-a2dp etc/init.d/S40btstack usr/sbin/s31-ext-test usr/sbin/s31-gpio usr/sbin/s31-config-archive usr/sbin/esp32-config'
+# Retired project diagnostics must not survive an incremental target tree.
+rm -f \
+	"${target_dir}/usr/bin/s31-hil-agent" \
+	"${target_dir}/usr/bin/s31-peripheral-test" \
+	"${target_dir}/usr/bin/s31-selftest" \
+	"${target_dir}/usr/bin/spidev_test" \
+	"${target_dir}/usr/sbin/s31-ext-test" \
+	"${target_dir}/usr/sbin/s31-crypto-test" \
+	"${target_dir}/usr/sbin/s31-hil-io" \
+	"${target_dir}/usr/sbin/s31-tlb-stress" \
+	"${target_dir}/usr/sbin/s31-cpu-sample"
+
+required_runtime='usr/sbin/s31-btstack-a2dp etc/init.d/S40btstack usr/sbin/s31-gpio usr/sbin/s31-config-archive usr/sbin/esp32-config'
 
 for required in ${required_runtime}; do
 	[ -x "${target_dir}/${required}" ] || {

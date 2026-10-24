@@ -22,7 +22,7 @@ def verify_compiler(prefix: Path, work_dir: Path, repo_root: Path) -> None:
     if not gcc.is_file():
         raise SystemExit(f"Compiler not found: {gcc}")
 
-    # The compiler supports opt-in Xesp tests, but its default libc is scalar.
+    # The default libc is scalar.
     libc = prefix / target / "sysroot" / "usr" / "lib" / "libc.so"
     if not libc.exists():
         raise SystemExit(f"libc not found: {libc}")
@@ -30,9 +30,6 @@ def verify_compiler(prefix: Path, work_dir: Path, repo_root: Path) -> None:
     objdump = prefix / "bin" / f"{target}-objdump"
     if not objdump.exists():
         raise SystemExit(f"objdump not found: {objdump}")
-    readelf = prefix / "bin" / f"{target}-readelf"
-    if not readelf.exists():
-        raise SystemExit(f"readelf not found: {readelf}")
 
     disasm_file = work_dir / "libc-disassembly.txt"
     disasm_file.write_text(_run([str(objdump), "-d", str(libc)]))
@@ -41,26 +38,6 @@ def verify_compiler(prefix: Path, work_dir: Path, repo_root: Path) -> None:
     for symbol in required_symbols:
         if f"<{symbol}>:" not in disasm_file.read_text():
             raise SystemExit(f"Missing symbol <{symbol}> in libc disassembly")
-
-    # Removing XespV from musl must not remove the compiler's explicit opt-in
-    # support, which is still used by standalone diagnostics.
-    extension_object = work_dir / "s31-ext-test.o"
-    _run([
-        str(gcc),
-        "-march=rv32imafbc_zicsr_zifencei_zaamo_zalrsc_zba_zbb_zbc_zbs_xesploop_xespv2p2",
-        "-mabi=ilp32",
-        "-mespv-spec=2p2",
-        "-I" + str(repo_root / "rootfs"),
-        "-c",
-        str(repo_root / "rootfs" / "s31_ext_test.S"),
-        "-o",
-        str(extension_object),
-    ])
-    extension_attributes = _run([str(readelf), "-A", str(extension_object)])
-    (work_dir / "s31-ext-test-attributes.txt").write_text(extension_attributes)
-    for extension in ("_xesploop", "_xespv2p2"):
-        if extension not in extension_attributes:
-            raise SystemExit(f"explicit compiler test is missing {extension}")
 
     verify_libc_scalar(prefix, work_dir, repo_root)
 

@@ -2,7 +2,8 @@ name: Release S31 Images
 
 on:
   push:
-    branches: [main]
+    branches: [main, push/softmac-pre-blob-20261023]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,7 +15,7 @@ jobs:
       contents: read
   build-and-release:
     needs: checks
-    if: startsWith(github.event.head_commit.message, 'release:')
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/push/softmac-pre-blob-20261023' || startsWith(github.event.head_commit.message, 'release:')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -76,7 +77,7 @@ jobs:
         run: |
           source "$IDF_PATH/export.sh"
           make TOOLCHAIN_RELEASE_TAG="$TOOLCHAIN_RELEASE_TAG" \
-            IDF_EXPORT="$IDF_PATH/export.sh" all coremark
+            IDF_EXPORT="$IDF_PATH/export.sh" all
 
       - name: Verify release images
         run: |
@@ -89,8 +90,7 @@ jobs:
             $OUT/images/radio.bin \
             $OUT/images/xipImage \
             $OUT/images/rootfs.sqfs \
-            $OUT/images/s31_full_flash.bin \
-            $OUT/staging/coremark/coremark.exe
+            $OUT/images/s31_full_flash.bin
           echo "=== esptool ==="
           source "$IDF_PATH/export.sh"
           esptool version
@@ -103,7 +103,6 @@ jobs:
           test -s $OUT/images/xipImage
           test -s $OUT/images/rootfs.sqfs
           test -s $OUT/images/s31_full_flash.bin
-          test -s $OUT/staging/coremark/coremark.exe
           python3 -c 'import os; from pathlib import Path; radio = (Path(os.environ["OUT"]) / "images/radio.bin").read_bytes(); full = (Path(os.environ["OUT"]) / "images/s31_full_flash.bin").read_bytes(); from tools.checks.layout import flash_layout; offset = flash_layout()[0]["SLOT_RADIO"]; assert full[offset:offset + len(radio)] == radio, "radio bundle is not embedded at SLOT_RADIO"'
           test ! -e bootloader
           test "$(cat cache/sources/btstack/.s31-btstack-version)" = \
@@ -164,7 +163,15 @@ jobs:
             --verify $OUT/images/build-manifest.json
           echo "All core artifacts verified OK"
 
+      - name: Upload built images
+        uses: actions/upload-artifact@v4
+        with:
+          name: s31-images-${{ github.sha }}
+          path: dist/current/*
+          if-no-files-found: error
+
       - name: Prepare release metadata
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         id: release
         env:
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
@@ -176,6 +183,7 @@ jobs:
           printf 'title=%s: %s\n' "$timestamp" "$subject" >> "$GITHUB_OUTPUT"
 
       - name: Publish full-flash image to GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}

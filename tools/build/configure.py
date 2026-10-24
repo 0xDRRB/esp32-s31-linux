@@ -11,16 +11,13 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from toolchain_identity import identify as toolchain_identity
 
-
 def digest(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
-
 def run(argv, **kw):
     print('+', ' '.join(map(str, argv)), flush=True)
     subprocess.run(list(map(str, argv)), check=True, **kw)
-
 
 def save_text(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -29,27 +26,28 @@ def save_text(path, text):
         temp.write_text(text)
         temp.replace(path)
 
-
 def save(path, value):
     save_text(path, json.dumps(value, sort_keys=True, indent=2) + '\n')
-
 
 def radio_exports(a):
     # Preserve the external XIP payload's kernel imports while modpost trims
     # exports. Avoid touching an unchanged list and rebuilding the kernel.
     output = subprocess.check_output([a.nm, '--undefined-only', '--format=posix',
                                       str(a.payload)], text=True)
-    symbols = sorted({line.split()[0] for line in output.splitlines() if line.strip()})
+    # Native NAPI CSD admission consumes a completion token without sleeping;
+    # retain that module API before the module itself has been built.
+    # Final SRAM TX copies complete partial checksums in the radio module.
+    # Retain the standard helper before that module is built/modposted.
+    symbols = sorted({line.split()[0] for line in output.splitlines() if line.strip()} |
+                     {'try_wait_for_completion',
+                      'skb_copy_and_csum_bits', '__s31_csum_copy'})
     save_text(a.output, ''.join(symbol + '\n' for symbol in symbols))
-
 
 def identity(files, values):
     return {'files': {str(Path(p).resolve()): digest(p) for p in files}, 'values': values}
 
-
 def same(path, obj):
     return path.exists() and json.loads(path.read_text()) == obj
-
 
 def parse_config(path):
     result = {}
@@ -60,7 +58,6 @@ def parse_config(path):
         elif line.startswith('# CONFIG_') and line.endswith(' is not set'):
             result[line[2:-11]] = 'n'
     return result
-
 
 def contracts(a):
     config = parse_config(a.output / '.config')
@@ -75,7 +72,6 @@ def contracts(a):
     bad = [f'{key}: expected {value}, resolved {config.get(key, "n")}' for key, value in required.items() if config.get(key, 'n') != value]
     if bad:
         raise SystemExit('Resolved feature contract failed:\n' + '\n'.join(bad))
-
 
 def native(a):
     a.output.mkdir(parents=True, exist_ok=True)
@@ -113,7 +109,6 @@ def native(a):
         contracts(a)
     save(a.output.parent / 'reports' / f'{a.kind}-inputs.json', obj)
 
-
 def idf(a):
     defaults = [a.source / 'sdkconfig.defaults', a.source / 'sdkconfig.radio.defaults']
     idf = Path(os.environ['IDF_PATH'])
@@ -144,7 +139,6 @@ def idf(a):
         raise SystemExit('No radio IDF archive targets resolved')
     run(['ninja', '-C', a.output, '-j', a.jobs, *closure])
 
-
 def buildroot(a):
     files = [a.source_config, Path(a.compiler), *a.fragment]
     obj = identity(files, [a.toolchain, a.overlay, a.static_overlay, str(a.external)])
@@ -170,7 +164,6 @@ def buildroot(a):
     resolved.write_text(digest(a.output / '.config') + '\n')
     save(a.output.parent / 'reports' / 'buildroot-inputs.json', obj)
 
-
 def package_inputs(a):
     # Buildroot local packages do not resync source automatically. A content stamp
     # selects only changed packages; failed builds leave the old stamp untouched.
@@ -186,7 +179,6 @@ def package_inputs(a):
                 run(make + [a.package + '-rebuild'])
         save(a.stamp, obj)
 
-
 def doctor(a):
     missing = []
     for name in ['make', 'python3', 'git', 'ninja', 'cmake', 'dtc', 'flock', 'bc', 'bison', 'flex', 'swig', 'rsync', 'xz', 'mksquashfs', 'unsquashfs']:
@@ -197,7 +189,6 @@ def doctor(a):
     if not shutil.which('mkfs.jffs2'):
         print('Optional persist-image tool missing: mkfs.jffs2 (normal firmware updates preserve persist).')
     print('Host prerequisites present. No downloads, builds or device actions performed.')
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

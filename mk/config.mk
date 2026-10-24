@@ -53,8 +53,6 @@ LP_OUT := $(BUILD_DIR)/lp
 RADIO_IDF_BUILD := $(BUILD_DIR)/idf-radio
 BUILDROOT_DL_DIR ?= $(CACHE_DIR)/downloads/buildroot
 BTSTACK_SOURCE_DIR ?= $(CACHE_DIR)/sources/btstack
-COREMARK_OUT := $(BUILD_DIR)/staging/coremark
-COREMARK_BIN := $(COREMARK_OUT)/coremark.exe
 S31_LAYOUT_CFG := $(ROOT)/configs/esp32s31-layout.cfg
 XIP_IMAGE := $(IMAGES_DIR)/xipImage
 UBOOT_ITB := $(IMAGES_DIR)/u-boot.itb
@@ -68,7 +66,9 @@ IDF_ROOT ?= $(HOME)/.espressif
 IDF_EXPORT ?= $(firstword $(wildcard $(IDF_PATH)/export.sh) $(wildcard $(IDF_ROOT)/master/esp-idf/export.sh))
 DEFCONFIG ?= esp32s31_defconfig
 LINUX_TARGET ?= xipImage
-LINUX_CMDLINE ?= earlycon=esp32s31uart,mmio,0x2038a000,115200 console=ttyS0,115200n8 rootfstype=squashfs ro init=/init irqaffinity=0 esp32s31_idle=wfi
+# Background device IRQs belong on CPU1. Radio installation pins its owned
+# mappings to CPU0 and prevents balancing before exposing their actions.
+LINUX_CMDLINE ?= earlycon=esp32s31uart,mmio,0x2038a000,115200 console=ttyS0,115200n8 rootfstype=squashfs ro init=/init irqaffinity=1 esp32s31_idle=wfi
 
 HOST_PYTHON ?= $(shell command -v python3)
 UBOOT_PYTHONPATH ?=
@@ -78,3 +78,4 @@ SOURCE_DATE_EPOCH ?= $(shell git -C $(ROOT) log -1 --format=%ct)
 export SOURCE_DATE_EPOCH
 IDF_TOOLS_PATH ?= $(IDF_ROOT)
 export IDF_TOOLS_PATH
+ESP_TOOLS ?= $(IDF_TOOLS_PATH)/tools/riscv32-esp-elf/$(ESP_ELF_RELEASE)/riscv32-esp-elf

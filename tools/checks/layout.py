@@ -18,9 +18,9 @@ def flash_layout(root=ROOT):
     sizes = dict(zip(SLOTS, (b - a for a, b in zip(points, points[1:]))))
     sizes["SPL"] = values["SIZE_SPL"]
     expected = {"SPL": 48 * 1024, "UBOOT_ITB": 320 * 1024,
-                "DTB": 64 * 1024, "RADIO": 1536 * 1024,
+                "DTB": 64 * 1024, "RADIO": 1792 * 1024,
                 "KERNEL": 6144 * 1024, "ROOTFS": 6144 * 1024,
-                "PERSIST": 2120 * 1024}
+                "PERSIST": 1864 * 1024}
     if sizes != expected or values["SLOT_SPL"] != 0x2000:
         raise ValueError("compact flash partition capacities differ from contract")
     if values["SLOT_UBOOT_ITB"] - (values["SLOT_SPL"] + sizes["SPL"]) != 0:

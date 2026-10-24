@@ -1,7 +1,6 @@
 config BR2_PACKAGE_S31_TOOLS
-	bool "ESP32-S31 diagnostic tools"
+	bool "ESP32-S31 runtime tools"
 	default y
 	help
-	  Installs the ESP32-S31 MMU diagnostics, memory benchmark and
-	  dynamic device-tree overlay manager. Standard Linux packages
-	  provide Wi-Fi, Bluetooth and GPIO userspace tools.
+	  Installs the device-tree overlay manager, radio module loader,
+	  GPIO utility and persistent configuration archive helper.
