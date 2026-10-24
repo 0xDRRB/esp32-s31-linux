@@ -144,8 +144,9 @@ static esp_err_t s31_timer_delete(esp_timer_handle_t timer, bool cancel,
 	uint32_t generation;
 
 	s31_timer_lock();
-	for (link = &s31_timers; *link && *link != timer; link = &(*link)->next)
-
+	for (link = &s31_timers; *link && *link != timer; link = &(*link)->next) {
+		/* Locate the link before validating and unlinking the timer. */
+	}
 	if (!*link) {
 		s31_timer_unlock();
 		return ESP_ERR_INVALID_ARG;
@@ -217,8 +218,9 @@ s31_timer_legacy_rearm(ETSTimer *legacy, uint64_t timeout_us,
     }
     s31_timer_lock();
     for (timer = s31_timers; timer && timer != legacy->timer_arg;
-         timer = timer->next)
-
+         timer = timer->next) {
+        /* Locate the timer before validating its legacy owner. */
+    }
     if (legacy->timer_expire != 0x12121212U || !timer) {
         s31_timer_unlock();
         s31_linux_sync_owner(NULL, S31_SYNC_OWNER_FATAL);

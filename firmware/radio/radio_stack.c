@@ -191,8 +191,9 @@ void __wrap_mpi_hal_read_result_hw_op(uint32_t *p, size_t n, size_t z_words)
 	volatile uint32_t *base = (volatile uint32_t *)RSA_Z_MEM;
 	size_t i;
 
-	while (*(volatile uint32_t *)RSA_QUERY_IDLE_REG == 0)
-
+	while (*(volatile uint32_t *)RSA_QUERY_IDLE_REG == 0) {
+		/* Poll completion before clearing the accelerator interrupt. */
+	}
 	*(volatile uint32_t *)RSA_INT_CLR_REG = 1;
 	for (i = 0; i < z_words; i++)
 		p[i] = base[i];
@@ -1319,8 +1320,6 @@ void s31_radio_shutdown_task(void *arg)
 		rc = esp_bt_controller_disable();
 		if (rc != 0 && rc != ESP_ERR_INVALID_STATE && !result)
 			result = rc;
-
-		if (!rc)
 
 		rc = esp_bt_controller_deinit();
 		if (rc != 0 && rc != ESP_ERR_INVALID_STATE && !result)

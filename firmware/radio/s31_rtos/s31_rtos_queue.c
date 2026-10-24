@@ -542,7 +542,6 @@ static BaseType_t s31_admitted_xQueueGenericSendFromISR(void *queue, const void 
 
 	if (ret)
 		s31_linux_sync_wake(q->wait_context);
-	else
 
 	/* FreeRTOS only ever promotes this flag to pdTRUE.  One ISR can perform
 	 * several queue operations using the same flag; a later failed/no-wake
