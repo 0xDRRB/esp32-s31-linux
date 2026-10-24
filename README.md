@@ -48,8 +48,8 @@ For a detailed overview of the porting progress, refer to [the support matrix](h
 
 | Feature | Status |
 |---|---|
-| Wi-Fi station | 🟡 Experimental |
-| Bluetooth (via BTstack) | 🟡 Experimental |
+| Wi-Fi station | 🟢 Stable |
+| Bluetooth (via BTstack) | 🟢 Stable |
 
 ### Peripherals
 
